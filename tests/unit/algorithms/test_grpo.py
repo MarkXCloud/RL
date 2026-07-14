@@ -68,6 +68,7 @@ def _mock_policy_generation() -> MagicMock:
     policy_generation = MagicMock(spec=MegatronGeneration)
     policy_generation.requires_kv_scale_sync = False
     policy_generation.get_logger_metrics.return_value = {}
+    policy_generation.get_and_clear_logger_metrics.return_value = {}
     return policy_generation
 
 
@@ -802,6 +803,13 @@ class StubAsyncTrajectoryCollector:
     @property
     def resume_after_refit(self):
         """Resume after refit - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())
+        return mock
+
+    @property
+    def invalidate_kv_cache_after_refit(self):
+        """Invalidate caches after refit - returns a remote-callable mock"""
         mock = MagicMock()
         mock.remote = MagicMock(return_value=MagicMock())
         return mock

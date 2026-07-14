@@ -2520,8 +2520,12 @@ def grpo_train(
                 ):
                     policy_generation.snapshot_step_metrics()
                 with timer.time("generation"):
-                    # Clear logger metrics for each generation step
-                    if policy_generation is not None:
+                    # Keep one metrics window across all dynamic-sampling batches
+                    # that contribute to this training step.
+                    if (
+                        policy_generation is not None
+                        and dynamic_sampling_num_gen_batches == 1
+                    ):
                         policy_generation.clear_logger_metrics()
                     # Use NeMo-Gym rollouts if enabled. We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
                     if _should_use_nemo_gym(master_config):
@@ -4279,13 +4283,6 @@ def async_grpo_train(
                     with timer.time("exposed_generation"):
                         ray.get(trajectory_collector.prepare_for_refit.remote())
 
-                    # Collect generation logger metrics for performance reporting
-                    # inflight batch sizes and num pending samples are collected from each worker
-                    if policy_generation is not None:
-                        generation_logger_metrics = (
-                            policy_generation.get_logger_metrics()
-                        )
-
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
@@ -4299,25 +4296,26 @@ def async_grpo_train(
                         # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
                         weight_version += 1
                         trajectory_collector.set_weight_version.remote(weight_version)
-                        trajectory_collector.resume_after_refit.remote()
 
                     timer.stop("idle/refit_bubble")
-
-                # Clear logger metrics after each refit (weight sync), starting a new logging cycle
-                if policy_generation is not None:
-                    policy_generation.clear_logger_metrics()
 
                 # Validation
                 val_metrics, validation_timings = None, None
                 is_last_step = step + 1 == master_config.grpo["max_num_steps"]
+                should_validate = (val_period > 0 and (step + 1) % val_period == 0) or (
+                    val_at_end and is_last_step
+                )
+                if should_validate and NEED_REFIT:
+                    ray.get(
+                        trajectory_collector.invalidate_kv_cache_after_refit.remote()
+                    )
 
                 # Run validation if it's a validation step or last step with val_at_end
-                if (val_period > 0 and (step + 1) % val_period == 0) or (
-                    val_at_end and is_last_step
-                ):
+                if should_validate:
                     with timer.time("idle/validation"):
                         # Pause trajectory collection during validation to reduce memory pressure
-                        trajectory_collector.pause.remote()
+                        if not NEED_REFIT:
+                            ray.get(trajectory_collector.pause.remote())
 
                         if NEED_REFIT and POLICY_GENERATION_STALE:
                             refit_policy_generation(
@@ -4347,8 +4345,18 @@ def async_grpo_train(
                         gc.collect()
                         torch.cuda.empty_cache()
 
-                        # Resume trajectory collection after validation
-                        trajectory_collector.resume.remote()
+                # Close the current vLLM metrics window immediately before
+                # resetting it. Requests observed during refit or validation
+                # are therefore retained; requests completing later naturally
+                # belong to the next window.
+                if policy_generation is not None:
+                    generation_logger_metrics = (
+                        policy_generation.get_and_clear_logger_metrics()
+                    )
+                if NEED_REFIT:
+                    trajectory_collector.resume_after_refit.remote()
+                elif should_validate:
+                    trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]

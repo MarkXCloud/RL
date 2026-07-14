@@ -216,14 +216,13 @@ class SyncRolloutActor:
             decompose_message_log,
         )
 
-        # Per-step generation-side metric hooks: snapshot once on the
-        # first DS iter so backends with per-step deltas have a stable
-        # anchor; clear accumulators before every rollout. Mirrors
-        # legacy ``grpo_train``.
+        # Per-step generation-side metric hooks: snapshot and clear once on the
+        # first DS iter so all dynamic-sampling batches share one metrics window.
         if self.policy_generation is not None:
             if first_iter and hasattr(self.policy_generation, "snapshot_step_metrics"):
                 self.policy_generation.snapshot_step_metrics()
-            self.policy_generation.clear_logger_metrics()
+            if first_iter:
+                self.policy_generation.clear_logger_metrics()
 
         cfg = self.master_config
         task_to_env = (

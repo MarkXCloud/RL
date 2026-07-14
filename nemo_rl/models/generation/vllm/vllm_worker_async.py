@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 import warnings
-from typing import Any, AsyncGenerator, Optional, cast
+from typing import Any, AsyncGenerator, Optional, TypedDict, cast
 
 import ray
 import torch
@@ -49,6 +49,106 @@ from nemo_rl.models.generation.vllm.utils import (
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 LOGGER = logging.getLogger(__name__)
+
+_VLLM_LATENCY_HISTOGRAM_NAMES = frozenset(
+    {
+        "vllm:time_to_first_token_seconds",
+        "vllm:inter_token_latency_seconds",
+        "vllm:request_time_per_output_token_seconds",
+        "vllm:e2e_request_latency_seconds",
+        "vllm:request_queue_time_seconds",
+        "vllm:request_inference_time_seconds",
+        "vllm:request_prefill_time_seconds",
+        "vllm:request_decode_time_seconds",
+    }
+)
+_VllmMetricSeriesKey = tuple[str, tuple[tuple[str, str], ...]]
+
+
+class _VllmHistogramTotal(TypedDict):
+    sum: float
+    count: int
+
+
+class _VllmCumulativeMetrics(TypedDict):
+    histograms: dict[_VllmMetricSeriesKey, _VllmHistogramTotal]
+
+
+def _read_vllm_cumulative_metrics() -> _VllmCumulativeMetrics:
+    """Read cumulative vLLM latency histograms by Prometheus series."""
+    # vLLM is an optional, heavyweight dependency, so keep this import lazy.
+    from vllm.v1.metrics.reader import Histogram, get_metrics_snapshot
+
+    histograms: dict[_VllmMetricSeriesKey, _VllmHistogramTotal] = {}
+    for metric in get_metrics_snapshot():
+        series_key = (metric.name, tuple(sorted(metric.labels.items())))
+        if (
+            isinstance(metric, Histogram)
+            and metric.name in _VLLM_LATENCY_HISTOGRAM_NAMES
+        ):
+            histograms[series_key] = {
+                "sum": float(metric.sum),
+                "count": int(metric.count),
+            }
+
+    return {"histograms": histograms}
+
+
+def _compute_vllm_metric_deltas(
+    baseline: _VllmCumulativeMetrics,
+    current: _VllmCumulativeMetrics,
+) -> Optional[dict[str, _VllmHistogramTotal]]:
+    """Compute request histogram deltas for the current logging window."""
+    missing_series = [
+        series_key
+        for series_key, baseline_total in baseline["histograms"].items()
+        if series_key not in current["histograms"] and baseline_total["count"] > 0
+    ]
+    reset_series = [
+        series_key
+        for series_key, current_total in current["histograms"].items()
+        if (baseline_total := baseline["histograms"].get(series_key)) is not None
+        and (
+            current_total["count"] < baseline_total["count"]
+            or current_total["sum"] < baseline_total["sum"]
+        )
+    ]
+    if missing_series or reset_series:
+        LOGGER.warning(
+            "Skipping incomplete vLLM histogram window after a metric reset: "
+            "missing_series=%s reset_series=%s",
+            missing_series,
+            reset_series,
+        )
+        return None
+
+    histogram_deltas: dict[str, _VllmHistogramTotal] = {}
+    for series_key, current_total in current["histograms"].items():
+        metric_name = series_key[0]
+        baseline_total = baseline["histograms"].get(series_key)
+        if baseline_total is None:
+            delta_sum = current_total["sum"]
+            delta_count = current_total["count"]
+        else:
+            delta_sum = current_total["sum"] - baseline_total["sum"]
+            delta_count = current_total["count"] - baseline_total["count"]
+
+        if delta_count <= 0:
+            continue
+        aggregate = histogram_deltas.setdefault(metric_name, {"sum": 0.0, "count": 0})
+        aggregate["sum"] += delta_sum
+        aggregate["count"] += delta_count
+
+    return histogram_deltas
+
+
+def _try_read_vllm_cumulative_metrics() -> Optional[_VllmCumulativeMetrics]:
+    """Read telemetry without allowing a metrics failure to stop training."""
+    try:
+        return _read_vllm_cumulative_metrics()
+    except Exception:
+        LOGGER.warning("Failed to read vLLM cumulative metrics", exc_info=True)
+        return None
 
 
 def _replace_prefix_tokens(
@@ -359,14 +459,15 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.num_pending_samples: list[int] = []
         self.kv_cache_usage_perc: list[float] = []
         self.generation_tokens: list[int] = []
+        self._vllm_cumulative_metrics_baseline = _try_read_vllm_cumulative_metrics()
 
         def _logger_loop():
             # Delay a little to let engine settle
             time.sleep(min(2.0, interval_s))
             while True:
                 try:
-                    for m in get_metrics_snapshot():
-                        with self._vllm_metrics_lock:
+                    with self._vllm_metrics_lock:
+                        for m in get_metrics_snapshot():
                             if isinstance(m, Gauge):
                                 # Log the vllm inflight batch sizes
                                 if m.name == "vllm:num_requests_running":
@@ -398,24 +499,50 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             flush=True,
         )
 
-    def get_vllm_logger_metrics(self) -> dict[str, Any]:
+    def _collect_vllm_logger_metrics(self, *, clear: bool) -> dict[str, Any]:
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return {}
 
         with self._vllm_metrics_lock:
+            current_cumulative_metrics = _try_read_vllm_cumulative_metrics()
             metric = {
                 "inflight_batch_sizes": copy.deepcopy(self.inflight_batch_sizes),
                 "num_pending_samples": copy.deepcopy(self.num_pending_samples),
                 "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
                 "generation_tokens": copy.deepcopy(self.generation_tokens),
             }
+            if (
+                self._vllm_cumulative_metrics_baseline is not None
+                and current_cumulative_metrics is not None
+            ):
+                histogram_deltas = _compute_vllm_metric_deltas(
+                    self._vllm_cumulative_metrics_baseline,
+                    current_cumulative_metrics,
+                )
+                if histogram_deltas is not None:
+                    metric["histogram_deltas"] = histogram_deltas
+            if clear:
+                self._vllm_cumulative_metrics_baseline = current_cumulative_metrics
+                self.inflight_batch_sizes = []
+                self.num_pending_samples = []
+                self.kv_cache_usage_perc = []
+                self.generation_tokens = []
         return metric
+
+    def get_vllm_logger_metrics(self) -> dict[str, Any]:
+        return self._collect_vllm_logger_metrics(clear=False)
+
+    def get_and_clear_vllm_logger_metrics(self) -> dict[str, Any]:
+        """Atomically close the current metrics window and return its values."""
+        return self._collect_vllm_logger_metrics(clear=True)
 
     def clear_vllm_logger_metrics(self) -> None:
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return
 
         with self._vllm_metrics_lock:
+            current_cumulative_metrics = _try_read_vllm_cumulative_metrics()
+            self._vllm_cumulative_metrics_baseline = current_cumulative_metrics
             self.inflight_batch_sizes = []
             self.num_pending_samples = []
             self.kv_cache_usage_perc = []

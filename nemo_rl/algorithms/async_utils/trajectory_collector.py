@@ -87,6 +87,7 @@ class AsyncTrajectoryCollector:
 
         self._refit_pause_cleared = _threading.Event()
         self._refit_pause_cleared.set()  # Start in cleared state
+        self._refit_cache_invalidated = False
 
         self.current_weight_version: int = start_step
         self.initial_weight_version: int = start_step
@@ -504,6 +505,7 @@ class AsyncTrajectoryCollector:
 
         # Pause new generation starts
         self._refit_pause_cleared.clear()
+        self._refit_cache_invalidated = False
         print("⏸️ New generation starts paused")
 
         # Check if we're using async engine
@@ -543,10 +545,10 @@ class AsyncTrajectoryCollector:
         elapsed = time.time() - start_time
         print(f"✅ Ready for refit (took {elapsed:.2f}s)")
 
-    def resume_after_refit(self) -> None:
-        """Resume new generation starts after refit is complete."""
-        print("🔄 Resuming generation starts after refit")
-
+    def invalidate_kv_cache_after_refit(self) -> None:
+        """Invalidate generation caches once while keeping collection paused."""
+        if self._refit_cache_invalidated:
+            return
         # Invalidate&recompute vLLM caches after the in-flight weight updates if
         # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
         # Otherwise, keep using the stale KV caches (Magistral-style implementation).
@@ -565,7 +567,13 @@ class AsyncTrajectoryCollector:
                     )
             except Exception as e:
                 print(f"⚠️ Failed to invalidate vLLM caches: {e}")
+        self._refit_cache_invalidated = True
 
+    def resume_after_refit(self) -> None:
+        """Finalize cache state and resume new generation starts after refit."""
+        print("🔄 Resuming generation starts after refit")
+
+        self.invalidate_kv_cache_after_refit()
         self._refit_pause_cleared.set()
 
     def wait_for_pending_generations(self) -> None:

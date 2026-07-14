@@ -292,3 +292,12 @@ class GenerationInterface(ABC):
             Dictionary of metrics. Format may vary by backend.
         """
         return {}
+
+    def get_and_clear_logger_metrics(self) -> dict[str, Any]:
+        """Get logger metrics and start a new collection window.
+
+        Backends may override this hook when both operations must be atomic.
+        """
+        metrics = self.get_logger_metrics()
+        self.clear_logger_metrics()
+        return metrics

@@ -915,8 +915,37 @@ def print_performance_metrics(
     return performance_metrics
 
 
+_VLLM_TIMELINE_METRIC_KEYS = (
+    "inflight_batch_sizes",
+    "num_pending_samples",
+    "kv_cache_usage_perc",
+    "generation_tokens",
+)
+
+
+def summarize_vllm_metric_deltas(
+    generation_logger_metrics: dict[str, Any],
+) -> dict[str, float | int]:
+    """Aggregate exact vLLM metric deltas across DP workers for W&B."""
+    histogram_deltas = generation_logger_metrics.get("histogram_deltas", {})
+
+    summary: dict[str, float | int] = {}
+    for raw_name, per_worker_deltas in histogram_deltas.items():
+        total_sum = sum(float(delta["sum"]) for delta in per_worker_deltas.values())
+        total_count = sum(int(delta["count"]) for delta in per_worker_deltas.values())
+        if total_count <= 0:
+            continue
+
+        metric_name = raw_name.removeprefix("vllm:")
+        summary[f"{metric_name}/mean"] = total_sum / total_count
+        if raw_name == "vllm:request_inference_time_seconds":
+            summary["finished_request_count"] = total_count
+
+    return summary
+
+
 def log_generation_metrics_to_wandb(
-    generation_logger_metrics: dict[str, dict[int, list[Any]]],
+    generation_logger_metrics: dict[str, Any],
     step: int,
     timeline_interval: float,
     logger: Logger,
@@ -929,13 +958,26 @@ def log_generation_metrics_to_wandb(
         timeline_interval: Interval between timeline points (in seconds)
         logger: Logger instance
     """
-    for generation_metric in generation_logger_metrics.keys():
+    if not generation_logger_metrics:
+        return
+
+    for generation_metric in _VLLM_TIMELINE_METRIC_KEYS:
+        if generation_metric not in generation_logger_metrics:
+            continue
         logger.log_plot_per_worker_timeline_metrics(
             generation_logger_metrics[generation_metric],
             step=step,
             prefix="generation_metrics",
             name=generation_metric,
             timeline_interval=timeline_interval,
+        )
+
+    vllm_delta_summary = summarize_vllm_metric_deltas(generation_logger_metrics)
+    if vllm_delta_summary:
+        logger.log_metrics(
+            vllm_delta_summary,
+            step=step,
+            prefix="generation_metrics/vllm",
         )
 
 

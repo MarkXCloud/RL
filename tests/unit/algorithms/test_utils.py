@@ -14,6 +14,7 @@
 
 import math
 from datetime import datetime
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -24,12 +25,71 @@ from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
     get_tokenizer,
+    log_generation_metrics_to_wandb,
     maybe_pad_last_batch,
     print_efficiency_summary,
     print_performance_metrics,
+    summarize_vllm_metric_deltas,
 )
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+_VLLM_INFERENCE_TIME = "vllm:request_inference_time_seconds"
+
+
+def test_vllm_histogram_mean_is_request_weighted_across_dp() -> None:
+    metrics = {
+        "histogram_deltas": {
+            _VLLM_INFERENCE_TIME: {
+                0: {"sum": 8.0, "count": 2},
+                1: {"sum": 6.0, "count": 6},
+            }
+        }
+    }
+
+    summary = summarize_vllm_metric_deltas(metrics)
+
+    assert summary["request_inference_time_seconds/mean"] == pytest.approx(1.75)
+    assert summary["finished_request_count"] == 8
+
+
+def test_vllm_histogram_mean_omits_zero_count() -> None:
+    metrics = {
+        "histogram_deltas": {_VLLM_INFERENCE_TIME: {0: {"sum": 0.0, "count": 0}}}
+    }
+
+    assert summarize_vllm_metric_deltas(metrics) == {}
+
+
+def test_log_generation_metrics_logs_histograms_as_scalars() -> None:
+    logger = MagicMock()
+    metrics = {
+        "inflight_batch_sizes": {0: [0, 1]},
+        "histogram_deltas": {_VLLM_INFERENCE_TIME: {0: {"sum": 6.0, "count": 2}}},
+    }
+
+    log_generation_metrics_to_wandb(
+        metrics,
+        step=3,
+        timeline_interval=0.5,
+        logger=logger,
+    )
+
+    logger.log_plot_per_worker_timeline_metrics.assert_called_once_with(
+        {0: [0, 1]},
+        step=3,
+        prefix="generation_metrics",
+        name="inflight_batch_sizes",
+        timeline_interval=0.5,
+    )
+    logger.log_metrics.assert_called_once_with(
+        {
+            "request_inference_time_seconds/mean": 3.0,
+            "finished_request_count": 2,
+        },
+        step=3,
+        prefix="generation_metrics/vllm",
+    )
 
 
 @pytest.fixture

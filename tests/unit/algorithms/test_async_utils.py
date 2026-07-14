@@ -1417,6 +1417,8 @@ class TestAsyncTrajectoryCollector:
 
         # Test prepare for refit (should complete without hanging)
         ray.get(collector.prepare_for_refit.remote())
+        ray.get(collector.invalidate_kv_cache_after_refit.remote())
+        ray.get(collector.invalidate_kv_cache_after_refit.remote())
         ray.get(collector.resume_after_refit.remote())
 
         ray.kill(collector)

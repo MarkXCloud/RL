@@ -980,8 +980,8 @@ class VllmGeneration(GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
 
-    def get_vllm_logger_metrics(self) -> dict[str, Any]:
-        """Collect vLLM logger metrics from vLLM workers (model-owner actors only)."""
+    def _collect_vllm_logger_metrics(self, worker_method_name: str) -> dict[str, Any]:
+        """Collect vLLM logger metrics from model-owner workers."""
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return {}
         if not self.cfg["vllm_cfg"].get("async_engine", False):
@@ -992,19 +992,25 @@ class VllmGeneration(GenerationInterface):
         for dp_idx in range(self.worker_group.dp_size):
             worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_idx)
             future = self.worker_group.run_single_worker_single_data(
-                "get_vllm_logger_metrics",
+                worker_method_name,
                 worker_idx=worker_idx,
             )
             futures.append(future)
             dp_indices.append(dp_idx)
 
         results = ray.get(futures)
-        vllm_logger_metrics: dict[str, dict[int, list[Any]]] = {
+        vllm_logger_metrics: dict[str, Any] = {
             "inflight_batch_sizes": {},  # dp_idx -> list[int]
             "num_pending_samples": {},  # dp_idx -> list[int]
             "kv_cache_usage_perc": {},  # dp_idx -> list[float]
             "generation_tokens": {},  # dp_idx -> list[int]
         }
+        histogram_metrics_valid = all(
+            stats and "histogram_deltas" in stats for stats in results
+        )
+        if histogram_metrics_valid:
+            # raw metric name -> dp_idx -> cumulative-window delta
+            vllm_logger_metrics["histogram_deltas"] = {}
 
         for dp_idx, stats in zip(dp_indices, results):
             if not stats:
@@ -1023,8 +1029,19 @@ class VllmGeneration(GenerationInterface):
             generation_tokens = stats.get("generation_tokens")
             if generation_tokens:
                 vllm_logger_metrics["generation_tokens"][dp_idx] = generation_tokens
+            if histogram_metrics_valid:
+                for metric_name, delta in stats["histogram_deltas"].items():
+                    vllm_logger_metrics["histogram_deltas"].setdefault(metric_name, {})[
+                        dp_idx
+                    ] = delta
 
         return vllm_logger_metrics
+
+    def get_vllm_logger_metrics(self) -> dict[str, Any]:
+        return self._collect_vllm_logger_metrics("get_vllm_logger_metrics")
+
+    def get_and_clear_vllm_logger_metrics(self) -> dict[str, Any]:
+        return self._collect_vllm_logger_metrics("get_and_clear_vllm_logger_metrics")
 
     def clear_vllm_logger_metrics(self) -> None:
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
@@ -1044,6 +1061,10 @@ class VllmGeneration(GenerationInterface):
     def get_logger_metrics(self) -> dict[str, Any]:
         """Get logger metrics for performance reporting."""
         return self.get_vllm_logger_metrics()
+
+    def get_and_clear_logger_metrics(self) -> dict[str, Any]:
+        """Atomically close and return the current metrics window."""
+        return self.get_and_clear_vllm_logger_metrics()
 
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.
