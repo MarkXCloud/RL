@@ -15,6 +15,7 @@
 import types
 
 import pytest
+import torch
 
 pytestmark = pytest.mark.vllm
 
@@ -169,3 +170,174 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
         for path in patched_paths
     )
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
+
+
+def test_get_module_from_param_name_applies_qwen35_prefix_mapper(fp8_module):
+    fp8 = fp8_module
+    model = torch.nn.Module()
+    model.packed_modules_mapping = {}
+    model.hf_to_vllm_mapper = types.SimpleNamespace(
+        apply_list=lambda names: [
+            name.replace("model.language_model.", "language_model.model.", 1)
+            for name in names
+        ]
+    )
+    model.language_model = torch.nn.Module()
+    model.language_model.model = torch.nn.Module()
+    model.language_model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    expected_module = torch.nn.Linear(4, 4, bias=False)
+    model.language_model.model.layers[0].projection = expected_module
+
+    actual_module = fp8._get_module_from_param_name(
+        model, "model.language_model.layers.0.projection.weight"
+    )
+
+    assert actual_module is expected_module
+
+
+@pytest.mark.parametrize(
+    ("target_dtype", "expected"),
+    [(torch.float8_e4m3fn, True), (torch.bfloat16, False)],
+)
+def test_is_fp8_weight_recognizes_grouped_experts(
+    fp8_module, monkeypatch, target_dtype, expected
+):
+    fp8 = fp8_module
+
+    class FakeFusedMoE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w13_weight = types.SimpleNamespace(dtype=target_dtype)
+            self.w2_weight = types.SimpleNamespace(dtype=target_dtype)
+
+    monkeypatch.setattr(fp8, "FusedMoE", FakeFusedMoE)
+    model = torch.nn.Module()
+    model.packed_modules_mapping = {}
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    model.model.layers[0].mlp = torch.nn.Module()
+    model.model.layers[0].mlp.experts = FakeFusedMoE()
+
+    assert fp8._is_fp8_weight("model.layers.0.mlp.experts.down_proj", model) is expected
+
+
+def test_quantize_grouped_experts_blockwise_preserves_expert_boundaries(
+    fp8_module, monkeypatch
+):
+    fp8 = fp8_module
+    grouped_weight = torch.arange(2 * 128 * 128, dtype=torch.float32).reshape(
+        2, 128, 128
+    )
+    flat_scale = torch.tensor([1.0, 2.0]).reshape(2, 1, 1)
+
+    def fake_cast(flat_weight, weight_block_size):
+        assert flat_weight.shape == (256, 128)
+        assert weight_block_size == [128, 128]
+        return flat_weight, flat_scale
+
+    monkeypatch.setattr(fp8, "cast_tensor_to_fp8_blockwise", fake_cast)
+
+    quantized, scale = fp8._quantize_grouped_experts_blockwise(grouped_weight)
+
+    torch.testing.assert_close(quantized, grouped_weight)
+    torch.testing.assert_close(scale, flat_scale.squeeze(-1).reshape(2, 1, 1))
+
+
+@pytest.mark.parametrize(
+    ("projection", "expected_calls"),
+    [
+        ("gate_up_proj", 2),
+        ("down_proj", 1),
+    ],
+)
+def test_quantize_grouped_moe_expert_blockwise(
+    fp8_module, monkeypatch, projection, expected_calls
+):
+    fp8 = fp8_module
+    fp8.global_fp8_config = fp8.FP8Config(is_mx=False)
+    num_experts = 2
+    out_features = 8 if projection == "gate_up_proj" else 4
+    weight = torch.arange(num_experts * out_features * 3, dtype=torch.float32).reshape(
+        num_experts, out_features, 3
+    )
+    grouped_projections = []
+
+    def fake_quantize(grouped_projection):
+        grouped_projections.append(grouped_projection.clone())
+        scale = torch.full(
+            (num_experts, 1, 1), len(grouped_projections), dtype=torch.float32
+        )
+        return grouped_projection, scale
+
+    monkeypatch.setattr(fp8, "_quantize_grouped_experts_blockwise", fake_quantize)
+
+    key = f"model.layers.0.mlp.experts.{projection}"
+    quantized = fp8._quantize_grouped_moe_expert(key, weight)
+
+    assert [name for name, _ in quantized] == [key, f"{key}_scale_inv"]
+    torch.testing.assert_close(quantized[0][1], weight)
+    assert len(grouped_projections) == expected_calls
+
+    if projection == "gate_up_proj":
+        torch.testing.assert_close(grouped_projections[0], weight[:, :4, :])
+        torch.testing.assert_close(grouped_projections[1], weight[:, 4:, :])
+        expected_scale = torch.cat(
+            (torch.ones(num_experts, 1, 1), torch.full((num_experts, 1, 1), 2)),
+            dim=1,
+        )
+    else:
+        torch.testing.assert_close(grouped_projections[0], weight)
+        expected_scale = torch.ones(num_experts, 1, 1)
+    torch.testing.assert_close(quantized[1][1], expected_scale)
+
+
+def test_quantize_grouped_moe_expert_mxfp8(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    fp8.global_fp8_config = fp8.FP8Config(is_mx=True)
+    original_weight = torch.ones(2, 4, 3)
+    quantized_weight = torch.zeros_like(original_weight, dtype=torch.float8_e4m3fn)
+    scale = torch.ones(2, 4, 1, dtype=torch.uint8)
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "mxfp8_e4m3_quantize",
+        lambda weight: (quantized_weight, scale),
+    )
+
+    key = "model.layers.0.mlp.experts.down_proj"
+    quantized = fp8._quantize_grouped_moe_expert(key, original_weight)
+
+    assert [name for name, _ in quantized] == [
+        key,
+        f"{key}_scale_from_checkpoint",
+    ]
+    assert quantized[0][1] is quantized_weight
+    assert quantized[1][1] is scale
+
+
+def test_load_weights_routes_grouped_experts_to_backend_quantizer(
+    fp8_module, monkeypatch
+):
+    fp8 = fp8_module
+    fp8.global_fp8_config = fp8.FP8Config(is_mx=False)
+    original_weight = torch.ones(2, 4, 3)
+    quantized_weight = torch.zeros(4, 3)
+    loaded_weights = []
+    model = types.SimpleNamespace(
+        load_weights=lambda weights: loaded_weights.extend(weights)
+    )
+    model_runner = types.SimpleNamespace(model=model)
+
+    monkeypatch.setattr(fp8, "_is_fp8_weight", lambda _name, _model: True)
+    monkeypatch.setattr(
+        fp8,
+        "_quantize_grouped_moe_expert",
+        lambda _name, _weight: [("quantized.weight", quantized_weight)],
+    )
+
+    key = "model.layers.0.mlp.experts.down_proj"
+    fp8.load_weights([(key, original_weight)], model_runner)
+
+    assert loaded_weights[0][0] == "quantized.weight"
+    assert loaded_weights[0][1] is quantized_weight

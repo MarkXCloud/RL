@@ -42,6 +42,11 @@ MXFP8_BLOCK_QUANT_KWARGS = {
     "quant_algo": "MXFP8",
 }
 
+GROUPED_MOE_EXPERT_SUFFIXES = (
+    "mlp.experts.gate_up_proj",
+    "mlp.experts.down_proj",
+)
+
 
 @dataclass(frozen=True)
 class FP8Config:
@@ -92,7 +97,15 @@ def monkey_patch_vllm_ray_executor(fp8_config):
     if fp8_config.model_parallel_size > 1:
         # we patch vllm's collective_rpc so that before vllm initalizes the model on each rank, we execute
         # a ray remote that patches each worker with the required fp8 vllm patches
-        from vllm.v1.executor.ray_executor import RayDistributedExecutor
+        try:
+            from vllm.v1.executor.ray_executor import RayDistributedExecutor
+        except ModuleNotFoundError as error:
+            if error.name != "vllm.v1.executor.ray_executor":
+                raise
+            # vLLM versions before 0.20 used the longer module name.
+            from vllm.v1.executor.ray_distributed_executor import (
+                RayDistributedExecutor,
+            )
 
         original_run_workers = RayDistributedExecutor.collective_rpc
 
@@ -365,6 +378,13 @@ def _get_params_in_layers(param_names, layers):
 
 
 def _get_module_from_param_name(model, name: str):
+    mapper = getattr(model, "hf_to_vllm_mapper", None)
+    if mapper is not None:
+        mapped_names = mapper.apply_list([name])
+        if not mapped_names:
+            return None
+        name = mapped_names[0]
+
     # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
     # The module path is all but the last part (the parameter's own name)
     path_parts = name.split(".")
@@ -378,19 +398,6 @@ def _get_module_from_param_name(model, name: str):
     }
     if module_path[-1] in reversed_mapping.keys():
         module_path[-1] = reversed_mapping[module_path[-1]]
-    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
-        model.hf_to_vllm_mapper, "orig_to_new_prefix"
-    ):
-        if module_path[0] in model.hf_to_vllm_mapper.orig_to_new_prefix:
-            module_path[0] = model.hf_to_vllm_mapper.orig_to_new_prefix[module_path[0]]
-    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
-        model.hf_to_vllm_mapper, "orig_to_new_substr"
-    ):
-        for i in range(len(module_path)):
-            if module_path[i] in model.hf_to_vllm_mapper.orig_to_new_substr:
-                module_path[i] = model.hf_to_vllm_mapper.orig_to_new_substr[
-                    module_path[i]
-                ]
 
     current_module = model
     try:
@@ -411,7 +418,7 @@ def _is_fp8_weight(name, model):
     if name not in fp8_state.seen_params:
         fp8_state.seen_params.add(name)
         # Filter out bias params
-        if name.endswith("weight"):
+        if name.endswith("weight") or name.endswith(GROUPED_MOE_EXPERT_SUFFIXES):
             module = _get_module_from_param_name(model, name)
             # We currently only quantize linear layers
             if (
@@ -433,7 +440,12 @@ def load_weights(weights, model_runner):
     model = model_runner.model
 
     for k, v in weights:
-        if not _is_fp8_weight(k, model):
+        is_grouped_moe_expert = k.endswith(GROUPED_MOE_EXPERT_SUFFIXES)
+        is_fp8_weight = _is_fp8_weight(k, model)
+        if is_grouped_moe_expert and is_fp8_weight:
+            weights_quantized.extend(_quantize_grouped_moe_expert(k, v))
+            continue
+        if not is_fp8_weight:
             weights_quantized.append((k, v))
             continue
         # Cast the weight into fp8 and its scale factor
@@ -547,6 +559,75 @@ def cast_tensor_to_fp8_blockwise(
 
     # Convert to target format, but still in original precision container
     return fp_data, descale_fp
+
+
+def _quantize_grouped_experts_blockwise(
+    grouped_moe_expert: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Blockwise-quantize a grouped MoE projection without crossing experts."""
+    if grouped_moe_expert.ndim != 3:
+        raise ValueError(
+            "Grouped MoE expert weights must have shape "
+            f"[experts, out_features, in_features], got {grouped_moe_expert.shape}"
+        )
+
+    block_m, block_n = FP8_BLOCK_QUANT_KWARGS["weight_block_size"]
+    num_experts, out_features, in_features = grouped_moe_expert.shape
+    if out_features % block_m != 0 or in_features % block_n != 0:
+        raise ValueError(
+            f"Grouped expert shape {tuple(grouped_moe_expert.shape)} is not aligned "
+            f"to FP8 block size {(block_m, block_n)}"
+        )
+
+    flat_weight = grouped_moe_expert.reshape(num_experts * out_features, in_features)
+    weight_fp8, scale_inv = cast_tensor_to_fp8_blockwise(
+        flat_weight.to(torch.float),
+        weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
+    )
+    return weight_fp8.reshape(grouped_moe_expert.shape), scale_inv.squeeze(-1).reshape(
+        num_experts, out_features // block_m, in_features // block_n
+    )
+
+
+def _quantize_grouped_moe_expert(
+    key: str, weight: torch.Tensor
+) -> list[tuple[str, torch.Tensor]]:
+    """Quantize grouped Qwen3.5 experts for vLLM's grouped loader."""
+    if weight.ndim != 3:
+        raise ValueError(
+            "Grouped MoE expert weights must have shape "
+            f"[experts, out_features, in_features], got {weight.shape}"
+        )
+
+    if global_fp8_config.is_mx:
+        from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+            mxfp8_e4m3_quantize,
+        )
+
+        weight_fp8, scale = mxfp8_e4m3_quantize(weight)
+        return [(key, weight_fp8), (f"{key}_scale_from_checkpoint", scale)]
+
+    projection = key.rsplit(".", 1)[1]
+    if projection == "gate_up_proj":
+        if weight.shape[1] % 2 != 0:
+            raise ValueError(
+                "gate_up_proj output dimension must split evenly into gate and up"
+            )
+        intermediate_size = weight.shape[1] // 2
+        gate_weight, gate_scale = _quantize_grouped_experts_blockwise(
+            weight[:, :intermediate_size, :].contiguous()
+        )
+        up_weight, up_scale = _quantize_grouped_experts_blockwise(
+            weight[:, intermediate_size:, :].contiguous()
+        )
+        weight_fp8 = torch.cat((gate_weight, up_weight), dim=1)
+        scale = torch.cat((gate_scale, up_scale), dim=1)
+    elif projection == "down_proj":
+        weight_fp8, scale = _quantize_grouped_experts_blockwise(weight.contiguous())
+    else:
+        raise ValueError(f"Unsupported grouped MoE projection: {projection}")
+
+    return [(key, weight_fp8), (f"{key}_scale_inv", scale)]
 
 
 # Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175

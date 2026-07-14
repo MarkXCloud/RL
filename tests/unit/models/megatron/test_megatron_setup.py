@@ -1078,6 +1078,69 @@ class TestApplyPerformanceConfig:
 
 
 @pytest.mark.mcore
+class TestApplyFreezeConfig:
+    """Tests for _apply_freeze_config."""
+
+    def test_applies_supported_provider_fields(self):
+        from nemo_rl.models.megatron.setup import _apply_freeze_config
+
+        model_cfg = SimpleNamespace(
+            freeze_language_model=False,
+            freeze_vision_model=False,
+            freeze_vision_projection=False,
+        )
+        freeze_config = {
+            "freeze_language_model": False,
+            "freeze_vision_model": True,
+            "freeze_vision_projection": True,
+        }
+
+        _apply_freeze_config(
+            model_cfg, {"megatron_cfg": {"freeze_config": freeze_config}}
+        )
+
+        for key, value in freeze_config.items():
+            assert getattr(model_cfg, key) is value
+
+    def test_rejects_unsupported_provider_fields(self):
+        from nemo_rl.models.megatron.setup import _apply_freeze_config
+
+        model_cfg = SimpleNamespace(freeze_vision_model=False)
+
+        with pytest.raises(ValueError, match="unsupported_freeze_option"):
+            _apply_freeze_config(
+                model_cfg,
+                {
+                    "megatron_cfg": {
+                        "freeze_config": {"unsupported_freeze_option": True}
+                    }
+                },
+            )
+
+    def test_rejects_existing_non_freeze_fields(self):
+        from nemo_rl.models.megatron.setup import _apply_freeze_config
+
+        model_cfg = SimpleNamespace(sequence_parallel=False)
+
+        with pytest.raises(ValueError, match="sequence_parallel"):
+            _apply_freeze_config(
+                model_cfg,
+                {"megatron_cfg": {"freeze_config": {"sequence_parallel": True}}},
+            )
+
+    def test_rejects_non_boolean_values(self):
+        from nemo_rl.models.megatron.setup import _apply_freeze_config
+
+        model_cfg = SimpleNamespace(freeze_vision_model=False)
+
+        with pytest.raises(TypeError, match="must be booleans"):
+            _apply_freeze_config(
+                model_cfg,
+                {"megatron_cfg": {"freeze_config": {"freeze_vision_model": "yes"}}},
+            )
+
+
+@pytest.mark.mcore
 class TestValidateOptimizerConfig:
     """Tests for _validate_optimizer_config function."""
 

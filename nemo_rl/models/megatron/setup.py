@@ -554,6 +554,9 @@ def setup_model_config(
     # Apply performance settings
     _apply_performance_config(model_cfg, config)
 
+    # Apply model freezing before Megatron builds distributed parameter buffers.
+    _apply_freeze_config(model_cfg, config)
+
     # Validate optimizer configuration
     _validate_optimizer_config(config)
 
@@ -877,6 +880,35 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
             model_cfg.fp8_param = fp8_cfg["fp8_param"]
         except KeyError as e:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
+
+
+def _apply_freeze_config(model_cfg: Any, config: PolicyConfig) -> None:
+    """Apply model-specific freeze options to the Megatron Bridge provider."""
+    freeze_config = config["megatron_cfg"].get("freeze_config")
+    if freeze_config is None:
+        return
+
+    unsupported_keys = sorted(
+        key
+        for key in freeze_config
+        if not key.startswith("freeze_") or not hasattr(model_cfg, key)
+    )
+    if unsupported_keys:
+        raise ValueError(
+            f"{type(model_cfg).__name__} does not support freeze_config keys: "
+            f"{unsupported_keys}"
+        )
+
+    non_boolean_keys = sorted(
+        key for key, value in freeze_config.items() if not isinstance(value, bool)
+    )
+    if non_boolean_keys:
+        raise TypeError(
+            f"freeze_config values must be booleans; invalid keys: {non_boolean_keys}"
+        )
+
+    for key, value in freeze_config.items():
+        setattr(model_cfg, key, value)
 
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:
