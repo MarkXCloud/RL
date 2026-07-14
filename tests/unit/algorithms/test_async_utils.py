@@ -1199,26 +1199,57 @@ class TestAsyncTrajectoryCollector:
         collector._should_pause_for_generation_limits = lambda: False
         collector.running = True
 
-    def test_collection_loop_marks_data_exhausted_on_natural_completion(self):
-        """for...else path: iterator drains cleanly -> data_exhausted, not errored."""
+    def test_collection_loop_cycles_dataloader_across_epochs(self):
+        """A finite dataloader is re-iterated until collection is stopped."""
         collector = self.create_local_collector()
         self._prime_collection_loop(collector)
         processed = []
-        collector._process_batch = lambda batch: processed.append(batch)
+
+        def _process_batch(batch):
+            processed.append(batch)
+            if len(processed) == 5:
+                collector.running = False
+
+        collector._process_batch = _process_batch
         collector.dataloader = [{"b": 0}, {"b": 1}]
 
         collector._collection_loop()
 
-        assert processed == [{"b": 0}, {"b": 1}]
-        assert collector.data_exhausted is True
+        assert processed == [
+            {"b": 0},
+            {"b": 1},
+            {"b": 0},
+            {"b": 1},
+            {"b": 0},
+        ]
         assert collector.collection_failed is False
         status = collector.get_status()
-        assert status["data_exhausted"] is True
         assert status["errored"] is False
         assert status["running"] is False
 
+    def test_collection_loop_retries_empty_first_pass_after_resume(self):
+        """An empty resumed remainder is followed by a fresh epoch."""
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+        processed = []
+        dataloader = mock.MagicMock()
+        dataloader.__iter__.side_effect = [iter([]), iter([{"b": 0}])]
+
+        def _process_batch(batch):
+            processed.append(batch)
+            collector.running = False
+
+        collector._process_batch = _process_batch
+        collector.dataloader = dataloader
+
+        collector._collection_loop()
+
+        assert processed == [{"b": 0}]
+        assert dataloader.__iter__.call_count == 2
+        assert collector.collection_failed is False
+
     def test_collection_loop_marks_errored_on_crash(self):
-        """A crash sets errored (not data_exhausted) so driver guards fail fast."""
+        """A crash sets errored so driver guards fail fast."""
         collector = self.create_local_collector()
         self._prime_collection_loop(collector)
 
@@ -1231,14 +1262,12 @@ class TestAsyncTrajectoryCollector:
         collector._collection_loop()
 
         assert collector.collection_failed is True
-        assert collector.data_exhausted is False
         status = collector.get_status()
         assert status["errored"] is True
-        assert status["data_exhausted"] is False
         assert status["running"] is False
 
-    def test_collection_loop_no_exhaustion_on_manual_stop(self):
-        """Breaking out (running=False) must not set data_exhausted/errored."""
+    def test_collection_loop_no_error_on_manual_stop(self):
+        """Breaking out with running=False is a clean stop."""
         collector = self.create_local_collector()
         self._prime_collection_loop(collector)
 
@@ -1250,10 +1279,8 @@ class TestAsyncTrajectoryCollector:
 
         collector._collection_loop()
 
-        assert collector.data_exhausted is False
         assert collector.collection_failed is False
         status = collector.get_status()
-        assert status["data_exhausted"] is False
         assert status["errored"] is False
 
     def create_mock_config(self) -> MasterConfig:

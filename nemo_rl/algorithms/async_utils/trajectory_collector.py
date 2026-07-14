@@ -77,7 +77,6 @@ class AsyncTrajectoryCollector:
             k: _threading.Lock() for k in self.teacher_worker_groups
         }
         self.running = False
-        self.data_exhausted = False
         self.collection_failed = False
 
         self._pg_lock: _threading.Lock = _threading.Lock()
@@ -252,74 +251,77 @@ class AsyncTrajectoryCollector:
 
         print("Collection thread started, start_collection returning")
 
-    def is_data_exhausted(self) -> bool:
-        """Check if collection stopped because the dataloader ran out of data."""
-        return self.data_exhausted
-
     def get_status(self) -> dict:
         """Return a snapshot of the collector's internal state for driver-side diagnostics."""
         with self._threads_lock:
             inflight_workers = len(self._inflight_threads)
         return {
             "running": self.running,
-            "data_exhausted": self.data_exhausted,
             "errored": self.collection_failed,
             "inflight_workers": inflight_workers,
         }
 
     def _collection_loop(self):
-        """Run the collection loop in background thread."""
-        dataloader_exhausted = False
+        """Collect continuously, restarting the dataloader after each epoch.
+
+        Setup rejects dataloaders with zero batches. A restored
+        ``StatefulDataLoader`` can still yield no batches on its first pass when
+        the checkpoint was saved at an epoch boundary; re-iterating it starts a
+        fresh epoch.
+        """
         try:
-            for batch in self.dataloader:
-                if not self.running:
-                    break
-
-                # Check if manually paused and wait
-                if not self._manual_pause_cleared.is_set() and self.running:
-                    self._manual_pause_cleared.wait()
-
-                # Check if refit is in progress and wait
-                if not self._refit_pause_cleared.is_set() and self.running:
-                    print("⏸️ Pausing collection for refit...")
-                    with self._efficiency_timer.time("idle/refit_event_wait"):
-                        self._refit_pause_cleared.wait()
-                    print("▶️ Refit completed, resuming collection")
-
-                # Check if generation limits require pausing collection
-                if self._should_pause_for_generation_limits() and self.running:
-                    # Only log warning once per weight version
-                    if self._last_limit_warning_version != self.current_weight_version:
-                        async_cfg = self.master_config.grpo.get("async_grpo", {})
-                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-                        target_weights = [
-                            self.current_weight_version + i
-                            for i in range(max_trajectory_age)
-                        ]
-
-                        print(
-                            f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
-                            f"already exist in buffer. Waiting for weight update..."
-                        )
-                        self._last_limit_warning_version = self.current_weight_version
-
-                        self._generation_limit_cleared.clear()  # Clear the event to pause
-
-                    # Efficiently wait for generation limits to be cleared (no polling!)
-                    with self._efficiency_timer.time("idle/generation_limit_pause"):
-                        self._generation_limit_cleared.wait()
-
-                    # Double-check we're still running after being woken up
+            while self.running:
+                for batch in self.dataloader:
                     if not self.running:
                         break
 
-                if not self.running:
-                    break
+                    # Check if manually paused and wait
+                    if not self._manual_pause_cleared.is_set() and self.running:
+                        self._manual_pause_cleared.wait()
 
-                self._process_batch(batch)
-            else:
-                # for-loop completed without break → dataloader iterator exhausted
-                dataloader_exhausted = True
+                    # Check if refit is in progress and wait
+                    if not self._refit_pause_cleared.is_set() and self.running:
+                        print("⏸️ Pausing collection for refit...")
+                        with self._efficiency_timer.time("idle/refit_event_wait"):
+                            self._refit_pause_cleared.wait()
+                        print("▶️ Refit completed, resuming collection")
+
+                    # Check if generation limits require pausing collection
+                    if self._should_pause_for_generation_limits() and self.running:
+                        # Only log warning once per weight version
+                        if (
+                            self._last_limit_warning_version
+                            != self.current_weight_version
+                        ):
+                            async_cfg = self.master_config.grpo.get("async_grpo", {})
+                            max_trajectory_age = async_cfg["max_trajectory_age_steps"]
+                            target_weights = [
+                                self.current_weight_version + i
+                                for i in range(max_trajectory_age)
+                            ]
+
+                            print(
+                                f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
+                                f"already exist in buffer. Waiting for weight update..."
+                            )
+                            self._last_limit_warning_version = (
+                                self.current_weight_version
+                            )
+
+                            self._generation_limit_cleared.clear()  # Clear the event to pause
+
+                        # Efficiently wait for generation limits to be cleared (no polling!)
+                        with self._efficiency_timer.time("idle/generation_limit_pause"):
+                            self._generation_limit_cleared.wait()
+
+                        # Double-check we're still running after being woken up
+                        if not self.running:
+                            break
+
+                    if not self.running:
+                        break
+
+                    self._process_batch(batch)
 
         except Exception as e:
             print(f"❌ Error in trajectory collection: {e}")
@@ -329,15 +331,7 @@ class AsyncTrajectoryCollector:
             self.collection_failed = True
         finally:
             self.running = False
-            if dataloader_exhausted:
-                self.data_exhausted = True
-                print(
-                    "❌ Trajectory collection stopped: dataloader exhausted "
-                    "(max_num_epochs reached). No more data available for generation. "
-                    "Increase max_num_epochs or use a larger dataset."
-                )
-            else:
-                print("🛑 Trajectory collection stopped")
+            print("🛑 Trajectory collection stopped")
 
     def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
         """Process a single batch and generate for one target weight."""

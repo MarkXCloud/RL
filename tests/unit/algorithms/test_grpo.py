@@ -1606,7 +1606,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
     with (
         patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
         patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
-        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
+        patch("nemo_rl.algorithms.grpo.StatefulDataLoader") as mock_dataloader,
         pytest.raises(
             AssertionError,
             match="policy.generation.colocated.resources.gpus_per_node must be explicitly set",
@@ -1614,7 +1614,85 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
     ):
         # Configure mocks to skip checkpoint loading
         mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        mock_dataloader.return_value.__len__.return_value = 1
         setup(master_config, tokenizer, dataset, None)
+
+
+def test_setup_rejects_empty_training_dataloader(mock_grpo_components):
+    """A loader with no full batches fails before worker initialization."""
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo["batch_multiplier"] = 1
+    master_config.grpo["val_period"] = 0
+    master_config.grpo["val_at_start"] = False
+    master_config.grpo["val_at_end"] = False
+    master_config.data["shuffle"] = False
+    master_config.data["num_workers"] = 0
+
+    empty_dataloader = MagicMock(spec=StatefulDataLoader)
+    empty_dataloader.__len__.return_value = 0
+
+    with (
+        patch.object(grpo_mod, "Logger"),
+        patch.object(grpo_mod, "CheckpointManager") as checkpointer_cls,
+        patch.object(grpo_mod, "StatefulDataLoader", return_value=empty_dataloader),
+    ):
+        checkpointer_cls.return_value.get_latest_checkpoint_path.return_value = None
+        checkpointer_cls.return_value.load_training_info.return_value = None
+
+        with pytest.raises(
+            ValueError,
+            match="Training dataloader is empty \\(0 batches per epoch\\)",
+        ):
+            grpo_mod.setup(master_config, MagicMock(), MagicMock(), None)
+
+
+def test_setup_rejects_empty_task_dataloader(mock_grpo_components):
+    """Every task loader must contain at least one full batch."""
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo["batch_multiplier"] = 1
+    master_config.grpo["val_period"] = 0
+    master_config.grpo["val_at_start"] = False
+    master_config.grpo["val_at_end"] = False
+    master_config.data.update(
+        {
+            "use_multiple_dataloader": True,
+            "num_prompts_per_dataloader": 1,
+            "shuffle": False,
+            "num_workers": 0,
+        }
+    )
+
+    empty_dataloader = MagicMock(spec=StatefulDataLoader)
+    empty_dataloader.__len__.return_value = 0
+    nonempty_dataloader = MagicMock(spec=StatefulDataLoader)
+    nonempty_dataloader.__len__.return_value = 1
+
+    with (
+        patch.object(grpo_mod, "Logger"),
+        patch.object(grpo_mod, "CheckpointManager") as checkpointer_cls,
+        patch.object(
+            grpo_mod,
+            "StatefulDataLoader",
+            side_effect=[empty_dataloader, nonempty_dataloader],
+        ),
+    ):
+        checkpointer_cls.return_value.get_latest_checkpoint_path.return_value = None
+        checkpointer_cls.return_value.load_training_info.return_value = None
+
+        with pytest.raises(
+            ValueError,
+            match=r"training dataloaders are empty .*tasks=\['empty_task'\]",
+        ):
+            grpo_mod.setup(
+                master_config,
+                MagicMock(),
+                {"empty_task": MagicMock(), "nonempty_task": MagicMock()},
+                None,
+            )
 
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
@@ -1649,7 +1727,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
     with (
         patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
         patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
-        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
+        patch("nemo_rl.algorithms.grpo.StatefulDataLoader") as mock_dataloader,
         pytest.raises(
             AssertionError,
             match="policy.generation.colocated.resources.gpus_per_node must be explicitly set",
@@ -1657,6 +1735,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
     ):
         # Configure mocks to skip checkpoint loading
         mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        mock_dataloader.return_value.__len__.return_value = 1
         setup(master_config, tokenizer, dataset, None)
 
 

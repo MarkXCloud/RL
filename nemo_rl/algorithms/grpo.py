@@ -427,6 +427,18 @@ def setup(
                 flush=True,
             )
 
+        empty_task_names = [
+            task_name
+            for task_name, task_dataloader in dataloaders.items()
+            if len(task_dataloader) == 0
+        ]
+        if empty_task_names:
+            raise ValueError(
+                "One or more training dataloaders are empty (0 batches per epoch): "
+                f"tasks={empty_task_names}, batch_size={dataloader_batch_size}, "
+                "drop_last=True. Check data.train paths and batch sizing."
+            )
+
         train_sample_count = sum(
             len(task_dataloader) for task_dataloader in dataloaders.values()
         )
@@ -443,6 +455,15 @@ def setup(
         print(
             f"  ✓ Training dataloader loaded with {train_sample_count} samples",
             flush=True,
+        )
+
+    # Keep empty-data validation in setup so async collectors can treat every
+    # iterator exhaustion as an epoch boundary and immediately start the next.
+    if train_sample_count == 0:
+        raise ValueError(
+            "Training dataloader is empty (0 batches per epoch): the dataset is "
+            f"smaller than one batch (batch_size={dataloader_batch_size}, "
+            "drop_last=True). Check data.train.data_path and batch sizing."
         )
 
     # Load validation dataset if provided
@@ -3856,18 +3877,14 @@ def async_grpo_train(
 
         collector_status = ray.get(trajectory_collector.get_status.remote())
         if (
-            (
-                collector_status["data_exhausted"]
-                or collector_status.get("errored", False)
-            )
+            collector_status.get("errored", False)
             and not collector_status["running"]
             and collector_status["inflight_workers"] == 0
         ):
             raise RuntimeError(
-                f"Trajectory collector stopped: dataloader exhausted while waiting for initial buffer fill at step={step}. "
-                f"The dataset ran out of data before training could start. "
+                f"Trajectory collector failed while waiting for initial buffer fill at step={step}. "
                 f"Collector status: {collector_status}. "
-                f"Increase data.train.max_num_epochs or use a larger dataset."
+                "Check the collector traceback above for the root cause."
             )
 
         wait_iterations += 1
@@ -3961,18 +3978,14 @@ def async_grpo_train(
                             trajectory_collector.get_status.remote()
                         )
                         if (
-                            (
-                                collector_status["data_exhausted"]
-                                or collector_status.get("errored", False)
-                            )
+                            collector_status.get("errored", False)
                             and not collector_status["running"]
                             and collector_status["inflight_workers"] == 0
                         ):
                             raise RuntimeError(
-                                f"Trajectory collector stopped: dataloader exhausted at training_step={step}. "
-                                f"The dataset ran out of data before training could complete. "
+                                f"Trajectory collector failed at training_step={step}. "
                                 f"Collector status: {collector_status}. "
-                                f"Increase data.train.max_num_epochs or use a larger dataset."
+                                "Check the collector traceback above for the root cause."
                             )
 
                         with timer.time("idle/buffer_starvation"):
