@@ -470,6 +470,18 @@ By multiplying the first term of the loss function by the importance weights $\f
 
 To enable the importance sampling correction, set the config `use_importance_sampling_correction=True` in the `ClippedPGLossConfig`. By default, we set this config to False to align with standard GRPO.
 
+The policy-optimization ratio and rollout-mismatch correction are independent. `sequence_level_importance_ratios` controls whether the current/previous-policy ratio in the clipped surrogate is token-level or sequence-level (GSPO). For backward compatibility, rollout correction follows the same granularity by default. Set `token_level_importance_sampling_correction=True` to retain the GSPO sequence-level surrogate ratio while applying the previous/generation-policy correction per token:
+
+```yaml
+loss_fn:
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: true
+  token_level_importance_sampling_correction: true
+  token_level_loss: false
+```
+
+Rollout-correction log ratios are clamped to $[-20, 20]$ before exponentiation so large positive mismatches saturate instead of overflowing and being discarded.
+
 
 #### Overlong Filtering
 
@@ -581,13 +593,19 @@ Assuming other tokens have near-zero divergence, this single token's metrics wit
 Ideally, all KL divergence metrics should be close to 0, with values below 1e-3 considered acceptable. Investigate any metric that shows spikes above this threshold.
 
 ### Sampling Importance Ratio
-This feature is controlled by the parameter `sampling_importance_ratio`. It adjusts the weighting of samples based on the ratio between the target policy and the behavior policy, helping to correct for distributional shift in off-policy learning. Not to be confused with the clipped importance ratio in PPO/GRPO, this is the importance ratio between $\pi_{\text{training}}$ and $\pi_{\text{inference}}$.
+`sampling_importance_ratio` is an always-emitted metric for the rollout-mismatch ratio between $\pi_{\text{training}}$ and $\pi_{\text{inference}}$. It is distinct from the clipped current/previous-policy ratio in PPO, GRPO, and GSPO.
 
-This is simply $\frac{1}{|T|}\sum_{t \in \text{tokens}}\text{exp}(\text{log}(\pi_{\text{training}}(t)) - \text{log}(\pi_{\text{inference}}(t)))$
+With token-level rollout correction, it is:
+
+$$
+\frac{1}{|T|}\sum_{t \in \text{tokens}}\text{exp}(\text{log}(\pi_{\text{training}}(t)) - \text{log}(\pi_{\text{inference}}(t)))
+$$
+
+With sequence-level rollout correction, the token log ratios are summed before exponentiation and the resulting weights are averaged over samples. The metric reduction and distributed normalizer follow this rollout-correction granularity, independently of whether the loss itself is reduced by tokens or sequences.
 
 Similar to [Multiplicative Token Probability Error](#multiplicative-token-probability-error), this is a measure of how far off your inference backend is from your training framework. However, this metric is meant to find the bias in that error, rather than the variance, as it does not take the absolute value of the error. With some noise, this should hover around 1.
 
-This metric is always calculated and the per-token version (without the mean) is used in the loss function when [Importance Sampling Correction](#importance-sampling-correction) is enabled.
+This metric is always calculated. The corresponding token- or sequence-level weights are used in the loss only when [Importance Sampling Correction](#importance-sampling-correction) is enabled.
 
 ### Entropy
 This feature is controlled by the parameter `approx_entropy`. It estimates the entropy of the policy distribution, which can be used to encourage exploration and prevent premature convergence during training. We roughly approximate the entropy of the LLM's distribution throughout training by calculating:

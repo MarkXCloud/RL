@@ -63,6 +63,7 @@ loss_fn:
   truncated_importance_sampling_ratio: null
   truncated_importance_sampling_ratio_min: null
   sequence_level_importance_ratios: false
+  token_level_importance_sampling_correction: false
   token_level_loss: true
   force_on_policy_ratio: false
   use_kl_in_reward: false  # No KL in reward (KL penalty is 0 anyway)

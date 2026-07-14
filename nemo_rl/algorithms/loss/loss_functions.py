@@ -48,6 +48,9 @@ from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
+GSPO_LOG_RATIO_MAX = 10.0
+ROLLOUT_IS_LOG_RATIO_CLAMP = 20.0
+
 
 class DraftCrossEntropyLossConfig(TypedDict):
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup]
@@ -108,10 +111,8 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # --- Loss type ---
     disable_ppo_ratio: bool = False
     token_level_loss: bool = True
-    # If True, apply the off-policy importance-sampling correction at the
-    # sequence level (one weight per generated sample), as in GSPO.
-    # If False (default), correction is applied at the token level as in the
-    # original GRPO paper.
+    # If True, use one sequence-level policy-optimization ratio for every
+    # generated token, as in GSPO. If False, use token-level ratios as in GRPO.
     sequence_level_importance_ratios: bool = False
 
     # --- Clipping ---
@@ -134,6 +135,10 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # Async GRPO requires importance sampling correction enabled
     # Set to true when async_grpo.enabled is true
     use_importance_sampling_correction: bool = False
+    # Keep the rollout-mismatch correction token-level when the policy-
+    # optimization ratio is sequence-level. This matches rollout_is="token"
+    # while retaining the GSPO sequence-level curr/prev ratio.
+    token_level_importance_sampling_correction: bool = False
     # --- Truncated importance sampling ---
     # Type of truncated importance sampling:
     #   "tis"          – clamp IS weights to [min, max], where min defaults to 0
@@ -254,6 +259,10 @@ class ClippedPGLossFn(LossFunction):
 
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
+        self.use_sequence_level_rollout_importance_correction = (
+            self.sequence_level_importance_ratios
+            and not cfg.token_level_importance_sampling_correction
+        )
         self.positive_example_nll_weight = cfg.positive_example_nll_weight
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg.token_level_loss else LossType.SEQUENCE_LEVEL
@@ -314,9 +323,10 @@ class ClippedPGLossFn(LossFunction):
                     "truncated_importance_sampling_ratio_min should be set when truncated_importance_sampling_type is 'icepop' or 'seq-mask-tis'"
                 )
             if self.truncated_importance_sampling_type == "seq-mask-tis":
-                assert not self.sequence_level_importance_ratios, (
+                assert not self.use_sequence_level_rollout_importance_correction, (
                     "seq-mask-tis uses token-level IS correction with sequence-level masking, "
-                    "and is incompatible with sequence_level_importance_ratios=True"
+                    "and is incompatible with sequence-level rollout importance correction; "
+                    "set token_level_importance_sampling_correction=True"
                 )
 
         # Advertise, per returned metric, the global denominator it was
@@ -341,10 +351,10 @@ class ClippedPGLossFn(LossFunction):
             "policy_kl_error": MetricNormalizer.TOKENS,
             "js_divergence_error": MetricNormalizer.TOKENS,
             "approx_entropy": MetricNormalizer.TOKENS,
-            # Keyed on sequence_level_importance_ratios, NOT loss_type.
+            # Keyed on rollout-correction granularity, NOT loss_type.
             "sampling_importance_ratio": (
                 MetricNormalizer.SEQUENCES
-                if self.sequence_level_importance_ratios
+                if self.use_sequence_level_rollout_importance_correction
                 else MetricNormalizer.TOKENS
             ),
             # Raw count — the downstream per-microbatch sum IS the value.
@@ -521,16 +531,27 @@ class ClippedPGLossFn(LossFunction):
             ratios_clamped = ratios
         elif not self.disable_ppo_ratio:
             log_ratios = curr_logprobs - prev_logprobs
+            masked_log_ratios = torch.where(
+                mask.bool(), log_ratios, torch.zeros_like(log_ratios)
+            )
             if self.sequence_level_importance_ratios:
                 seq_log_ratio_mean = masked_mean(
-                    log_ratios,
+                    masked_log_ratios,
                     token_mask,
                     dim=-1,
                 ).unsqueeze(-1)
-                seq_ratio = seq_log_ratio_mean.exp()
-                ratios = seq_ratio.repeat(1, advantages.shape[1])
+                # Keep the sequence-level forward ratio while routing each
+                # token's backward gradient through its own current logprob.
+                # This is the GSPO straight-through formulation.
+                token_log_ratio_st = torch.where(
+                    mask.bool(),
+                    curr_logprobs - curr_logprobs.detach(),
+                    torch.zeros_like(curr_logprobs),
+                )
+                log_seq_ratios = token_log_ratio_st + seq_log_ratio_mean.detach()
+                ratios = torch.clamp(log_seq_ratios, max=GSPO_LOG_RATIO_MAX).exp()
             else:
-                ratios = log_ratios.exp()
+                ratios = masked_log_ratios.exp()
             ratios_clamped = ratios.clamp(
                 1.0 - self.ratio_clip_min, 1.0 + self.ratio_clip_max
             )
@@ -561,22 +582,37 @@ class ClippedPGLossFn(LossFunction):
         # -------------------------------------------------------------
         _is_filter_metrics: dict = {}  # populated for icepop / seq-mask-tis
         # See: docs/guides/grpo.md#importance-sampling-correction
-        if self.sequence_level_importance_ratios:
+        rollout_log_ratios = torch.where(
+            mask.bool(),
+            prev_logprobs - generation_logprobs,
+            torch.zeros_like(prev_logprobs),
+        )
+        if self.use_sequence_level_rollout_importance_correction:
             # importance weight w_i = exp(Σ_t (log π_actor − log π_behaviour))
-            seq_lp_diff = ((prev_logprobs - generation_logprobs) * mask).sum(dim=-1)
-            actor_importance_weights = torch.exp(seq_lp_diff).detach()
+            seq_lp_diff = rollout_log_ratios.sum(dim=-1)
+            actor_importance_weights = torch.exp(
+                torch.clamp(
+                    seq_lp_diff,
+                    min=-ROLLOUT_IS_LOG_RATIO_CLAMP,
+                    max=ROLLOUT_IS_LOG_RATIO_CLAMP,
+                )
+            ).detach()
             actor_importance_weights = torch.nan_to_num(
-                actor_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
+                actor_importance_weights, nan=0.0
             )
             # Broadcast to token dimension so we can reuse existing reduction
             actor_importance_weights_expanded = actor_importance_weights.unsqueeze(-1)
         else:
             # Token-level correction
             actor_importance_weights_expanded = torch.exp(
-                prev_logprobs - generation_logprobs
-            )
+                torch.clamp(
+                    rollout_log_ratios,
+                    min=-ROLLOUT_IS_LOG_RATIO_CLAMP,
+                    max=ROLLOUT_IS_LOG_RATIO_CLAMP,
+                )
+            ).detach()
             actor_importance_weights_expanded = torch.nan_to_num(
-                actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
+                actor_importance_weights_expanded, nan=0.0
             )
         # ---- Truncated Importance Sampling ----
         # "tis"          – clamp IS weights to [min, max], where min defaults to 0
@@ -632,14 +668,8 @@ class ClippedPGLossFn(LossFunction):
                 )
             elif self.truncated_importance_sampling_type == "seq-mask-tis":
                 # geo_mean_i = exp( mean_t( log(π_prev / π_gen) ) )
-                log_is_ratio = torch.nan_to_num(
-                    prev_logprobs - generation_logprobs,
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                )
                 seq_log_is_ratio_mean = masked_mean(
-                    log_is_ratio, token_mask, dim=-1
+                    rollout_log_ratios, token_mask, dim=-1
                 )  # [B]
                 seq_geomean_is_ratio = torch.exp(seq_log_is_ratio_mean).detach()  # [B]
                 seq_kept_mask = (
@@ -690,9 +720,9 @@ class ClippedPGLossFn(LossFunction):
 
         # Metric: sampling importance ratio (mean over samples)
         # See: docs/guides/grpo.md#sampling-importance-ratio
-        if self.sequence_level_importance_ratios:
+        if self.use_sequence_level_rollout_importance_correction:
             sample_importance_ratio = masked_mean(
-                actor_importance_weights,
+                actor_importance_weights.squeeze(-1),
                 sample_mask,
                 global_normalization_factor=global_valid_seqs,
             )

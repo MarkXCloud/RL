@@ -708,8 +708,8 @@ def test_clipped_pg_loss_cispo_incompatibility_asserts(incompatible_config):
       uses as the importance weight, so they are mutually exclusive.
     - force_on_policy_ratio makes every ratio 1.0, removing CISPO's clipped
       importance-weight behavior.
-    - sequence_level_importance_ratios changes the token-level IS weights that
-      CISPO is defined over.
+    - sequence_level_importance_ratios changes the PPO surrogate ratio to a
+      sequence-level ratio, while CISPO is defined over token-level ratios.
     - ratio_clip_c (dual clipping) runs after the CISPO loss assembly inside
       ClippedPGLossFn and would silently overwrite it.
     """
@@ -1554,6 +1554,31 @@ def test_clipped_pg_loss_rejects_tis_min_above_max(tis_type):
         ClippedPGLossFn(cfg)
 
 
+def test_seq_mask_tis_accepts_gspo_with_token_rollout_correction():
+    """seq-mask-tis conflicts with sequence rollout correction, not GSPO itself."""
+    cfg_kwargs = {
+        "token_level_loss": False,
+        "sequence_level_importance_ratios": True,
+        "use_importance_sampling_correction": True,
+        "truncated_importance_sampling_type": "seq-mask-tis",
+        "truncated_importance_sampling_ratio": 1.002,
+        "truncated_importance_sampling_ratio_min": 0.999,
+    }
+
+    with pytest.raises(
+        AssertionError, match="sequence-level rollout importance correction"
+    ):
+        ClippedPGLossFn(ClippedPGLossConfig(**cfg_kwargs))
+
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            **cfg_kwargs,
+            token_level_importance_sampling_correction=True,
+        )
+    )
+    assert not loss_fn.use_sequence_level_rollout_importance_correction
+
+
 @pytest.mark.parametrize(
     "tis_min,expected_weights,expected_oob_ratio",
     [
@@ -1594,14 +1619,11 @@ def test_clipped_pg_loss_tis_min_bound_defaults_to_zero(
 
 
 def test_clipped_pg_loss_seq_mask_tis():
-    """Tests ClippedPGLossFn with seq-mask-tis, including nan_to_num on -inf.
+    """Tests ClippedPGLossFn with seq-mask-tis, including fail-closed nonfinite IS.
 
     Uses reference bounds min=0.999, max=1.002.
     """
-    if not torch.cuda.is_available():
-        pytest.skip("No GPU available")
-
-    device = "cuda"
+    device = "cpu"
     data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
 
     cfg = ClippedPGLossConfig(
@@ -1638,16 +1660,17 @@ def test_clipped_pg_loss_seq_mask_tis():
     )
     torch.testing.assert_close(actual_loss, expected_loss, atol=1e-4, rtol=1e-3)
 
-    # nan_to_num: inject -inf → loss must stay finite
+    # A valid nonfinite ratio must reject the sequence instead of becoming ratio 1.
     data["generation_logprobs"][0, 2] = float("-inf")
-    actual_loss2, _ = loss_fn(
+    actual_loss2, metrics2 = loss_fn(
         data=data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
         global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
         **loss_input,
     )
-    assert not torch.isnan(actual_loss2), "Loss is NaN — nan_to_num fix not working"
-    assert not torch.isinf(actual_loss2), "Loss is inf — nan_to_num fix not working"
+    torch.testing.assert_close(actual_loss2, torch.tensor(0.0))
+    assert metrics2["is_oob_ratio"] == pytest.approx(1.0)
+    assert metrics2["sampling_importance_ratio"] == pytest.approx(0.0)
 
 
 def test_masked_mean_all_zeros():
@@ -2111,6 +2134,129 @@ def test_clipped_pg_loss_gspo_importance_sampling_correction():
         **loss_input,
     )
     torch.testing.assert_close(actual_loss, expected_actor_loss, atol=1e-4, rtol=1e-3)
+
+
+def _run_gspo_rollout_correction_test(
+    rollout_log_ratios: torch.Tensor,
+    *,
+    token_level_correction: bool,
+    curr_logprob_offset: float = 0.0,
+    advantage: float = 1.0,
+    requires_grad: bool = False,
+) -> tuple[torch.Tensor, dict, torch.Tensor, ClippedPGLossFn]:
+    """Run a CPU GSPO loss with controlled rollout-correction ratios."""
+    data, _, _, _ = _setup_clipped_pg_test_data(
+        batch_size=rollout_log_ratios.shape[0], device="cpu"
+    )
+    prev_logprobs = torch.full_like(rollout_log_ratios, -31.0)
+    data["advantages"][:, 1:] = advantage
+    data["prev_logprobs"][:, 1:] = prev_logprobs
+    data["generation_logprobs"][:, 1:] = prev_logprobs - rollout_log_ratios
+    curr_logprobs = (prev_logprobs + curr_logprob_offset).requires_grad_(requires_grad)
+
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            token_level_loss=False,
+            sequence_level_importance_ratios=True,
+            use_importance_sampling_correction=True,
+            token_level_importance_sampling_correction=token_level_correction,
+        )
+    )
+    loss, metrics = loss_fn(
+        next_token_logprobs=curr_logprobs,
+        data=data,
+        global_valid_seqs=data["sample_mask"].sum(),
+        global_valid_toks=(
+            data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+        ).sum(),
+    )
+    return loss, metrics, curr_logprobs, loss_fn
+
+
+def test_gspo_rollout_correction_granularity_and_gradient():
+    """Token rollout correction keeps GSPO forward and gradients token-local."""
+    rollout_weights = torch.tensor([[0.5, 1.0, 2.0], [2.0, 1.0, 1.0]])
+    rollout_log_ratios = rollout_weights.log()
+
+    sequence_loss, sequence_metrics, _, sequence_loss_fn = (
+        _run_gspo_rollout_correction_test(
+            rollout_log_ratios, token_level_correction=False
+        )
+    )
+    token_loss, token_metrics, curr_logprobs, token_loss_fn = (
+        _run_gspo_rollout_correction_test(
+            rollout_log_ratios,
+            token_level_correction=True,
+            requires_grad=True,
+        )
+    )
+    token_loss.backward()
+
+    assert (
+        ClippedPGLossConfig.model_fields[
+            "token_level_importance_sampling_correction"
+        ].default
+        is False
+    )
+    torch.testing.assert_close(sequence_loss, torch.tensor(-1.5))
+    assert sequence_metrics["sampling_importance_ratio"] == pytest.approx(1.5)
+    assert (
+        sequence_loss_fn.metric_normalizations["sampling_importance_ratio"]
+        is MetricNormalizer.SEQUENCES
+    )
+    torch.testing.assert_close(token_loss, torch.tensor(-1.25))
+    assert token_metrics["sampling_importance_ratio"] == pytest.approx(1.25)
+    assert (
+        token_loss_fn.metric_normalizations["sampling_importance_ratio"]
+        is MetricNormalizer.TOKENS
+    )
+    torch.testing.assert_close(curr_logprobs.grad, -rollout_weights / 6.0)
+
+
+@pytest.mark.parametrize(
+    "token_level_correction,rollout_log_ratios",
+    [
+        (True, [30.0, -30.0, 0.0]),
+        (False, [8.0, 8.0, 8.0]),
+        (False, [-8.0, -8.0, -8.0]),
+    ],
+)
+def test_rollout_importance_sampling_log_ratio_is_clamped(
+    token_level_correction, rollout_log_ratios
+):
+    """Large rollout log ratios saturate before exp instead of overflowing."""
+    rollout_log_ratios = torch.tensor([rollout_log_ratios])
+    loss, metrics, _, _ = _run_gspo_rollout_correction_test(
+        rollout_log_ratios,
+        token_level_correction=token_level_correction,
+    )
+
+    if token_level_correction:
+        expected_ratio = torch.exp(rollout_log_ratios.clamp(-20.0, 20.0)).mean()
+    else:
+        expected_ratio = torch.exp(rollout_log_ratios.sum().clamp(-20.0, 20.0))
+    assert torch.isfinite(loss)
+    torch.testing.assert_close(loss, -expected_ratio, rtol=1e-5, atol=0.0)
+    assert metrics["sampling_importance_ratio"] == pytest.approx(
+        expected_ratio.item(), rel=1e-5
+    )
+
+
+def test_gspo_policy_log_ratio_is_capped():
+    """The raw GSPO ratio remains finite before PPO clipping is applied."""
+    loss, metrics, _, _ = _run_gspo_rollout_correction_test(
+        torch.zeros((1, 3)),
+        token_level_correction=False,
+        curr_logprob_offset=11.0,
+        advantage=-1.0,
+    )
+
+    expected_ratio = torch.exp(torch.tensor(10.0))
+    torch.testing.assert_close(loss, expected_ratio)
+    assert metrics["probs_ratio"] == pytest.approx(expected_ratio.item())
+    assert metrics["probs_ratio_min"] == pytest.approx(expected_ratio.item())
+    assert metrics["probs_ratio_max"] == pytest.approx(expected_ratio.item())
 
 
 def setup_distillation_test_data(batch_size=2, seq_len=4, vocab_size=8, topk=64):
