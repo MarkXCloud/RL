@@ -482,6 +482,16 @@ loss_fn:
 
 Rollout-correction log ratios are clamped to $[-20, 20]$ before exponentiation so large positive mismatches saturate instead of overflowing and being discarded.
 
+The loss reports rollout-correction diagnostics in every mode, so GRPO and GSPO runs are directly comparable:
+
+- `gspo_policy_ratio` – sequence-level policy-optimization ratio $\exp(\text{mean}_t(\log \pi_\text{curr} - \log \pi_\text{prev}))$, averaged over sequences. This is the GSPO surrogate ratio; under token-level GRPO it is a pure diagnostic.
+- `rollout_is_token_ratio` – token-level rollout-mismatch ratio $\exp(\log \pi_\text{prev} - \log \pi_\text{gen})$, averaged over valid tokens (pre-truncation).
+- `rollout_is_seq_ratio` – full-sequence rollout-mismatch weight $\exp(\sum_t (\log \pi_\text{prev} - \log \pi_\text{gen}))$, averaged over sequences (pre-truncation).
+- `rollout_is_geomean_ratio` – length-normalized (geometric-mean) rollout-mismatch ratio $\exp(\text{mean}_t(\log \pi_\text{prev} - \log \pi_\text{gen}))$, averaged over sequences. This is the statistic `seq-mask-tis` filters on.
+- `rollout_is_effective_weight_mass` – mean applied importance weight per valid token after truncation/masking. 1.0 with correction off; decays as TIS clamps weights or `seq-mask-tis` rejects sequences.
+- `rollout_is_token_ratio_saturated_frac` / `rollout_is_seq_ratio_saturated_frac` – fraction of valid tokens (respectively sequences, via $|\sum_t \cdot|$) whose pre-exp log ratio hit the $\pm 20$ clamp. A nonzero sequence value means the full-sequence weight is saturating — without the clamp-before-exp order it would have overflowed `exp` and been zeroed by `nan_to_num(posinf=0)` instead of being truncated.
+- `is_seq_kept_frac` (`seq-mask-tis` only) – fraction of sequences whose geometric-mean ratio stays inside `[truncated_importance_sampling_ratio_min, truncated_importance_sampling_ratio]` (the complement of `is_oob_ratio`).
+
 
 #### Overlong Filtering
 

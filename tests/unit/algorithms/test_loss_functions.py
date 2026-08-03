@@ -2241,6 +2241,105 @@ def test_rollout_importance_sampling_log_ratio_is_clamped(
     assert metrics["sampling_importance_ratio"] == pytest.approx(
         expected_ratio.item(), rel=1e-5
     )
+    # The saturation counters must flag exactly the clamped entries.
+    expected_token_sat = (rollout_log_ratios.abs() >= 20.0).float().mean().item()
+    expected_seq_sat = float(rollout_log_ratios.sum().abs() >= 20.0)
+    assert metrics["rollout_is_token_ratio_saturated_frac"] == pytest.approx(
+        expected_token_sat
+    )
+    assert metrics["rollout_is_seq_ratio_saturated_frac"] == pytest.approx(
+        expected_seq_sat
+    )
+
+
+def test_rollout_correction_diagnostic_metrics_with_seq_mask_tis():
+    """Diagnostics decompose the GSPO ratio, ISC granularities, and band retention."""
+    data, _, _, _ = _setup_clipped_pg_test_data(batch_size=2, device="cpu")
+    rollout_weights = torch.tensor([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]])
+    rollout_log_ratios = rollout_weights.log()
+    prev_logprobs = torch.full_like(rollout_log_ratios, -31.0)
+    data["advantages"][:, 1:] = 1.0
+    data["prev_logprobs"][:, 1:] = prev_logprobs
+    data["generation_logprobs"][:, 1:] = prev_logprobs - rollout_log_ratios
+    curr_logprobs = prev_logprobs.clone()
+
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            token_level_loss=False,
+            sequence_level_importance_ratios=True,
+            use_importance_sampling_correction=True,
+            token_level_importance_sampling_correction=True,
+            truncated_importance_sampling_type="seq-mask-tis",
+            truncated_importance_sampling_ratio_min=0.99,
+            truncated_importance_sampling_ratio=1.01,
+        )
+    )
+    loss, metrics = loss_fn(
+        next_token_logprobs=curr_logprobs,
+        data=data,
+        global_valid_seqs=data["sample_mask"].sum(),
+        global_valid_toks=(
+            data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+        ).sum(),
+    )
+
+    # curr == prev -> GSPO surrogate ratio is 1. Sequence 2's geomean rollout
+    # ratio (2.0) leaves the [0.99, 1.01] band and is rejected; sequence 1
+    # (geomean 1.0) is kept with raw token weights of 1.0.
+    torch.testing.assert_close(loss, torch.tensor(-0.5))
+    # rel=1e-4: the ratios round-trip through float32 log/exp.
+    assert metrics["gspo_policy_ratio"] == pytest.approx(1.0, rel=1e-4)
+    assert metrics["rollout_is_token_ratio"] == pytest.approx(1.5, rel=1e-4)
+    assert metrics["rollout_is_seq_ratio"] == pytest.approx(4.5, rel=1e-4)
+    assert metrics["rollout_is_geomean_ratio"] == pytest.approx(1.5, rel=1e-4)
+    assert metrics["is_seq_kept_frac"] == pytest.approx(0.5)
+    assert metrics["is_oob_ratio"] == pytest.approx(0.5)
+    assert metrics["rollout_is_effective_weight_mass"] == pytest.approx(0.5, rel=1e-4)
+    assert metrics["sampling_importance_ratio"] == pytest.approx(0.5, rel=1e-4)
+    assert metrics["rollout_is_token_ratio_saturated_frac"] == pytest.approx(0.0)
+    assert metrics["rollout_is_seq_ratio_saturated_frac"] == pytest.approx(0.0)
+    norms = loss_fn.metric_normalizations
+    assert norms["gspo_policy_ratio"] is MetricNormalizer.SEQUENCES
+    assert norms["rollout_is_token_ratio"] is MetricNormalizer.TOKENS
+    assert norms["rollout_is_seq_ratio"] is MetricNormalizer.SEQUENCES
+    assert norms["rollout_is_geomean_ratio"] is MetricNormalizer.SEQUENCES
+    assert norms["rollout_is_effective_weight_mass"] is MetricNormalizer.TOKENS
+    assert norms["is_seq_kept_frac"] is MetricNormalizer.SEQUENCES
+
+
+def test_rollout_correction_diagnostics_without_correction_report_unit_mass():
+    """With correction off, diagnostics still report ratios but mass stays 1."""
+    rollout_weights = torch.tensor([[0.5, 1.0, 2.0]])
+    data, _, _, _ = _setup_clipped_pg_test_data(batch_size=1, device="cpu")
+    rollout_log_ratios = rollout_weights.log()
+    prev_logprobs = torch.full_like(rollout_log_ratios, -31.0)
+    data["advantages"][:, 1:] = 1.0
+    data["prev_logprobs"][:, 1:] = prev_logprobs
+    data["generation_logprobs"][:, 1:] = prev_logprobs - rollout_log_ratios
+
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            use_importance_sampling_correction=False,
+        )
+    )
+    _, metrics = loss_fn(
+        next_token_logprobs=prev_logprobs.clone(),
+        data=data,
+        global_valid_seqs=data["sample_mask"].sum(),
+        global_valid_toks=(
+            data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+        ).sum(),
+    )
+
+    # rel=1e-4: the ratios round-trip through float32 log/exp.
+    assert metrics["gspo_policy_ratio"] == pytest.approx(1.0, rel=1e-4)
+    assert metrics["rollout_is_token_ratio"] == pytest.approx(3.5 / 3, rel=1e-4)
+    assert metrics["rollout_is_seq_ratio"] == pytest.approx(1.0, rel=1e-4)
+    assert metrics["rollout_is_geomean_ratio"] == pytest.approx(1.0, rel=1e-4)
+    assert metrics["rollout_is_effective_weight_mass"] == pytest.approx(1.0, rel=1e-4)
+    assert "is_seq_kept_frac" not in metrics
 
 
 def test_gspo_policy_log_ratio_is_capped():

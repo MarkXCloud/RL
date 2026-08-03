@@ -357,6 +357,15 @@ class ClippedPGLossFn(LossFunction):
                 if self.use_sequence_level_rollout_importance_correction
                 else MetricNormalizer.TOKENS
             ),
+            # Rollout-correction diagnostics, logged in every mode so GRPO and
+            # GSPO runs stay comparable (docs/guides/grpo.md#importance-sampling-correction).
+            "gspo_policy_ratio": MetricNormalizer.SEQUENCES,
+            "rollout_is_token_ratio": MetricNormalizer.TOKENS,
+            "rollout_is_seq_ratio": MetricNormalizer.SEQUENCES,
+            "rollout_is_geomean_ratio": MetricNormalizer.SEQUENCES,
+            "rollout_is_effective_weight_mass": MetricNormalizer.TOKENS,
+            "rollout_is_token_ratio_saturated_frac": MetricNormalizer.TOKENS,
+            "rollout_is_seq_ratio_saturated_frac": MetricNormalizer.SEQUENCES,
             # Raw count — the downstream per-microbatch sum IS the value.
             "num_valid_samples": MetricNormalizer.NONE,
             # Normalized by the microbatch's own correct-token count, not a
@@ -376,6 +385,12 @@ class ClippedPGLossFn(LossFunction):
                 if self.truncated_importance_sampling_type == "seq-mask-tis"
                 else MetricNormalizer.TOKENS
             )
+            if self.truncated_importance_sampling_type == "seq-mask-tis":
+                # Band retention rate: fraction of sequences whose geometric-mean
+                # IS ratio stays inside [ratio_min, ratio].
+                self.metric_normalizations["is_seq_kept_frac"] = (
+                    MetricNormalizer.SEQUENCES
+                )
 
     def __call__(
         self,
@@ -685,6 +700,11 @@ class ClippedPGLossFn(LossFunction):
                         sample_mask,
                         global_normalization_factor=global_valid_seqs,
                     ).item(),
+                    "is_seq_kept_frac": masked_mean(
+                        seq_kept_mask,
+                        sample_mask,
+                        global_normalization_factor=global_valid_seqs,
+                    ).item(),
                 }
                 actor_importance_weights_expanded = (
                     actor_importance_weights_expanded * seq_kept_mask.unsqueeze(-1)
@@ -700,6 +720,81 @@ class ClippedPGLossFn(LossFunction):
             importance_weights_to_use = actor_importance_weights
         else:
             importance_weights_to_use = torch.ones_like(prev_logprobs)
+
+        # Rollout-correction diagnostics: the sequence-level policy-optimization
+        # ratio plus every rollout-mismatch ratio granularity, logged in every
+        # mode so GRPO and GSPO runs are directly comparable.
+        # See: docs/guides/grpo.md#importance-sampling-correction
+        with torch.no_grad():
+            policy_log_ratios = torch.where(
+                mask.bool(),
+                curr_logprobs - prev_logprobs,
+                torch.zeros_like(curr_logprobs),
+            )
+            # The GSPO surrogate ratio exp(mean_t(curr - prev)); a pure
+            # diagnostic when sequence_level_importance_ratios=False.
+            gspo_policy_ratio = masked_mean(
+                torch.exp(masked_mean(policy_log_ratios, token_mask, dim=-1)),
+                sample_mask,
+                global_normalization_factor=global_valid_seqs,
+            ).item()
+            # Token-level ISC weight exp(prev - gen), pre-truncation.
+            rollout_is_token_ratio = masked_mean(
+                torch.exp(
+                    torch.clamp(
+                        rollout_log_ratios,
+                        min=-ROLLOUT_IS_LOG_RATIO_CLAMP,
+                        max=ROLLOUT_IS_LOG_RATIO_CLAMP,
+                    )
+                ),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+            # Full-sequence ISC weight exp(Σ_t(prev - gen)), pre-truncation.
+            rollout_is_seq_ratio = masked_mean(
+                torch.exp(
+                    torch.clamp(
+                        rollout_log_ratios.sum(dim=-1),
+                        min=-ROLLOUT_IS_LOG_RATIO_CLAMP,
+                        max=ROLLOUT_IS_LOG_RATIO_CLAMP,
+                    )
+                ),
+                sample_mask,
+                global_normalization_factor=global_valid_seqs,
+            ).item()
+            # Length-normalized (geometric-mean) rollout ratio — the statistic
+            # seq-mask-tis filters on.
+            rollout_is_geomean_ratio = masked_mean(
+                torch.exp(masked_mean(rollout_log_ratios, token_mask, dim=-1)),
+                sample_mask,
+                global_normalization_factor=global_valid_seqs,
+            ).item()
+            # Mean applied weight per valid token after truncation/masking:
+            # 1.0 with correction off; decays as TIS clamps or seq-mask-tis
+            # rejects sequences.
+            # [B, 1] sequence-level weights broadcast against the [B, S] mask.
+            rollout_is_effective_weight_mass = masked_mean(
+                importance_weights_to_use,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+            # Saturation counters: how often the pre-exp log ratio hit the
+            # ±ROLLOUT_IS_LOG_RATIO_CLAMP bound. Nonzero seq saturation flags
+            # weights that would have overflowed exp entirely (and, before the
+            # clamp-before-exp fix, been zeroed by nan_to_num(posinf=0)).
+            rollout_is_token_ratio_saturated_frac = masked_mean(
+                (rollout_log_ratios.abs() >= ROLLOUT_IS_LOG_RATIO_CLAMP).float(),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+            rollout_is_seq_ratio_saturated_frac = masked_mean(
+                (
+                    rollout_log_ratios.sum(dim=-1).abs()
+                    >= ROLLOUT_IS_LOG_RATIO_CLAMP
+                ).float(),
+                sample_mask,
+                global_normalization_factor=global_valid_seqs,
+            ).item()
 
         if self.loss_type == LossType.TOKEN_LEVEL:
             actor_loss = masked_mean(
@@ -806,6 +901,13 @@ class ClippedPGLossFn(LossFunction):
                 "policy_kl_error": policy_kl_error,
                 "js_divergence_error": js_divergence_error,
                 "sampling_importance_ratio": sample_importance_ratio.item(),
+                "gspo_policy_ratio": gspo_policy_ratio,
+                "rollout_is_token_ratio": rollout_is_token_ratio,
+                "rollout_is_seq_ratio": rollout_is_seq_ratio,
+                "rollout_is_geomean_ratio": rollout_is_geomean_ratio,
+                "rollout_is_effective_weight_mass": rollout_is_effective_weight_mass,
+                "rollout_is_token_ratio_saturated_frac": rollout_is_token_ratio_saturated_frac,
+                "rollout_is_seq_ratio_saturated_frac": rollout_is_seq_ratio_saturated_frac,
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
