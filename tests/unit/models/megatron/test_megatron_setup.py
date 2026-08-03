@@ -903,7 +903,6 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": True,
                 "bias_activation_fusion": True,
                 "gradient_accumulation_fusion": False,
-                "use_fused_weighted_squared_relu": False,
             }
         }
 
