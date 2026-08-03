@@ -33,7 +33,7 @@ def _make_collective_update_extension(backend):
     state_info = object()
     ext.state_dict_info = {"model.weight": state_info}
     ext.model_update_group = object()
-    ext.model_runner = SimpleNamespace(model=object())
+    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
     ext.model_config = object()
     ext.device = object()
     return ext, state_info
@@ -103,6 +103,8 @@ def test_update_weights_from_collective_processes_weights_after_loading(monkeypa
         process_weights_after_loading,
     )
     ext, expected_state_info = _make_collective_update_extension(vllm_backend)
+    set_current_vllm_config = MagicMock(return_value=contextlib.nullcontext())
+    monkeypatch.setattr("vllm.config.set_current_vllm_config", set_current_vllm_config)
 
     def load_weights(weights):
         call_order.append("load")
@@ -129,6 +131,7 @@ def test_update_weights_from_collective_processes_weights_after_loading(monkeypa
 
     assert ext.update_weights_from_collective() is True
 
+    set_current_vllm_config.assert_called_once_with(ext.model_runner.vllm_config)
     assert process_calls == [(ext.model_runner.model, ext.model_config, ext.device)]
     assert call_order == ["broadcast", "load", "process", "kv", "gc", "empty_cache"]
 
