@@ -445,7 +445,17 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 output_item_dict["generation_str"] = generation_str
 
         if not nemo_rl_message_log:
-            input_messages = nemo_gym_result["responses_create_params"]["input"]
+            response = nemo_gym_result["response"]
+            input_messages = nemo_gym_result["responses_create_params"].get("input")
+            if not input_messages:
+                raise ValueError(
+                    "NeMo Gym returned a result with no generation data and no "
+                    "input messages. The environment likely failed before its first "
+                    "model response; inspect the Gym and model-server logs for the "
+                    "underlying error.\n"
+                    f"  Response error: {response.get('error')!r}.\n"
+                    f"  Incomplete details: {response.get('incomplete_details')!r}."
+                )
             prompt_token_ids = tokenizer.apply_chat_template(
                 input_messages, tokenize=True
             )

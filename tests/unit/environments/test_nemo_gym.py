@@ -224,6 +224,33 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert nemo_gym_result["response"]["output"][1]["generation_str"] == "6 7"
 
 
+def test_nemo_gym_postprocess_empty_input_reports_environment_failure():
+    class _Tokenizer:
+        def apply_chat_template(self, *_args, **_kwargs):
+            raise AssertionError("empty input must not be passed to the tokenizer")
+
+    nemo_gym_result = {
+        "response": {
+            "output": [],
+            "error": {"message": "EngineDeadError"},
+            "incomplete_details": None,
+        },
+        "responses_create_params": {"input": []},
+    }
+
+    class _MockSelf:
+        cfg = {}
+
+    with pytest.raises(
+        ValueError, match="no generation data and no input messages"
+    ) as exc_info:
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, _Tokenizer()
+        )
+
+    assert "EngineDeadError" in str(exc_info.value)
+
+
 @pytest.mark.nemo_gym
 def test_nemo_gym_sanity(
     nemo_gym,
