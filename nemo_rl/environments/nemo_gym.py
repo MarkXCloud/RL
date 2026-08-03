@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import os
 import subprocess
 from pathlib import Path
@@ -275,8 +276,14 @@ Depending on your data shape, you may want to change these values."""
                     nemo_gym_row, nemo_gym_result = await task
 
                 with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_result, tokenizer
+                    # This actor's single event loop serves every concurrent
+                    # run_rollouts call; the decode/tensor-packing below is
+                    # CPU-heavy (HF fast tokenizers release the GIL), so run
+                    # it in a worker thread instead of blocking the loop.
+                    nemo_rl_result = await asyncio.to_thread(
+                        self._postprocess_nemo_gym_to_nemo_rl_result,
+                        nemo_gym_result,
+                        tokenizer,
                     )
 
                 nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
