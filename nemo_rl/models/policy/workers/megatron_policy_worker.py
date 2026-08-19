@@ -1358,25 +1358,6 @@ class MegatronPolicyWorkerImpl(
             self.model.start_grad_sync()
         self.model.finish_grad_sync()
 
-        # Replicated-param grad all-reduce across TP. The regular train()
-        # path gets this from mcore's finalize_model_grads (the schedules
-        # call config.finalize_model_grads_func after the last backward);
-        # this split-step path bypasses the schedules' finalize, so without
-        # this call the params whose raw grads are per-rank partial sums —
-        # qk-layernorm weights (each rank only sees its local heads) and
-        # SP-flagged layernorms — silently diverge across TP ranks, one
-        # optimizer step at a time. Same call, same ordering (after the DP
-        # grad sync) as mcore finalize_model_grads.
-        from megatron.core.distributed.finalize_model_grads import (
-            _allreduce_non_tensor_model_parallel_grads,
-        )
-
-        _allreduce_non_tensor_model_parallel_grads(
-            [self.model],
-            get_model_config(self.model),
-            get_pg_collection(self.model).tp,
-        )
-
         # opt.step clips internally (clip_grad config); operates on the
         # already-rescaled grad. Returns (success, grad_norm, num_zeros).
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()

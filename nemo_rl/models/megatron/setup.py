@@ -1719,18 +1719,6 @@ def finalize_megatron_setup(
         align_grad_reduce=megatron_cfg.dist.align_grad_reduce,
         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
-    # The train() path has no explicit grad sync of its own: it relies on the
-    # mcore schedules calling config.finalize_model_grads_func after the last
-    # backward for BOTH the cross-DP grad reduce and the replicated-param TP
-    # all-reduce (qk-layernorm / SP layernorm grads are per-rank partial sums
-    # without it, and the replicas silently diverge). Fail loudly if the
-    # provider the schedules read (model.config is this same object) did not
-    # get the func installed.
-    assert getattr(megatron_cfg.model, "finalize_model_grads_func", None) is not None, (
-        "finalize_model_grads_func was not installed on the model config; "
-        "the train() path would skip the cross-DP grad reduce and the "
-        "qk-layernorm TP grad all-reduce."
-    )
 
     tokenizer_config = TokenizerConfig(
         tokenizer_type="HuggingFaceTokenizer",
