@@ -188,7 +188,11 @@ def _run_block_draft_forward(
     data_dict["draft_anchor_positions"] = anchors
     data_dict["draft_anchor_valid"] = anchor_valid
 
-    base_logits = draft_model(
+    method_kwargs = {}
+    if draft_model.method == "dspark":
+        # Teacher-forces the Markov/confidence heads inside the forward.
+        method_kwargs["input_ids"] = data_dict["input_ids"]
+    draft_out = draft_model(
         taps=captured_states.hidden_states,
         input_embeds=captured_states.inputs_embeds,
         anchors=anchors,
@@ -197,26 +201,18 @@ def _run_block_draft_forward(
         mask_embedding=get_policy_embedding_row(
             model, draft_model.mask_token_id
         ).detach(),
+        **method_kwargs,
     )
     if draft_model.method == "dflash":
         # Slot 0 is the anchor bonus slot (condition only); the gamma mask
         # slots align with labels x_{p+1} .. x_{p+gamma}.
-        return base_logits[:, :, 1:, :]
-
-    # DSpark: every slot predicts the next token; add the Markov transition
-    # bias of the ground-truth previous token (slot j predicts x_{p+1+j}, so
-    # its prev is x_{p+j}; slot 0's prev is the anchor token itself).
-    input_ids = data_dict["input_ids"]
-    batch_size, seq_len = input_ids.shape
-    gamma = draft_model.gamma
-    prev_pos = (
-        anchors.unsqueeze(-1)
-        + torch.arange(gamma, device=anchors.device).view(1, 1, -1)
-    ).clamp(max=seq_len - 1)
-    prev_ids = torch.gather(input_ids, 1, prev_pos.reshape(batch_size, -1)).reshape(
-        batch_size, anchors.shape[1], gamma
-    )
-    return base_logits + draft_model.markov_bias(prev_ids)
+        return draft_out[:, :, 1:, :]
+    elif draft_model.method == "dspark":
+        block_logits, confidence_pred = draft_out
+        data_dict["draft_confidence_pred"] = confidence_pred
+        return block_logits
+    else:
+        raise ValueError(f"Unknown block-draft method '{draft_model.method}'.")
 
 
 def forward_with_post_processing_fn(
@@ -620,18 +616,32 @@ class LossPostProcessor:
             if has_draft_logits:
                 draft_cfg = self.cfg["draft"]
                 draft_method = draft_cfg.get("method", "eagle3")
+                # Ctor kwargs for the method's draft LossFn (uniform shape;
+                # DraftLossWrapper splats them into the selected class).
                 if draft_method in ("dflash", "dspark"):
-                    draft_weights = resolve_block_draft_slot_weights(
-                        draft_cfg.get("loss_weighting"), int(draft_cfg["gamma"])
-                    )
+                    draft_loss_kwargs: dict[str, Any] = {
+                        "slot_weights": resolve_block_draft_slot_weights(
+                            draft_cfg.get("loss_weighting"), int(draft_cfg["gamma"])
+                        )
+                    }
+                    if draft_method == "dspark":
+                        for key in (
+                            "ce_loss_alpha",
+                            "tv_loss_alpha",
+                            "confidence_head_alpha",
+                        ):
+                            if draft_cfg.get(key) is not None:
+                                draft_loss_kwargs[key] = float(draft_cfg[key])
                 else:
-                    draft_weights = draft_cfg.get("ttt_pass_weights")
+                    draft_loss_kwargs = {
+                        "pass_weights": draft_cfg.get("ttt_pass_weights")
+                    }
                 loss_fn_wrapped = DraftLossWrapper(
                     loss_fn=loss_fn_wrapped,
                     prepare_fn=prepare_loss_input_wrapped,
                     data_dict=data_dict,
                     loss_weight=float(draft_cfg["loss_weight"]),
-                    ttt_pass_weights=draft_weights,
+                    draft_loss_kwargs=draft_loss_kwargs,
                     global_draft_pass_counts=global_draft_pass_counts,
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),

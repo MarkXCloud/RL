@@ -271,21 +271,31 @@ def test_block_draft_model_forward_backward(method, tmp_path):
         lm_head_weight = torch.randn(vocab, hidden, device="cuda", dtype=torch.bfloat16)
         mask_embedding = torch.randn(hidden, device="cuda", dtype=torch.bfloat16)
 
-        logits = model(
+        method_kwargs = {}
+        if method == "dspark":
+            method_kwargs["input_ids"] = torch.randint(
+                0, vocab, (batch, seq_len), device="cuda"
+            )
+        out = model(
             taps=taps,
             input_embeds=embeds,
             anchors=anchors,
             anchor_valid=anchor_valid,
             lm_head_weight=lm_head_weight,
             mask_embedding=mask_embedding,
+            **method_kwargs,
         )
-        expected_width = gamma + 1 if method == "dflash" else gamma
+        if method == "dflash":
+            logits = out
+            expected_width = gamma + 1
+            loss = logits.float().sum()
+        else:
+            # Markov-biased logits + confidence prediction, both from forward.
+            logits, confidence_pred = out
+            expected_width = gamma
+            assert confidence_pred.shape == (batch, anchors.shape[1], gamma)
+            loss = logits.float().sum() + confidence_pred.sum()
         assert logits.shape == (batch, anchors.shape[1], expected_width, vocab)
-
-        loss = logits.float().sum()
-        if method == "dspark":
-            prev_tokens = torch.randint(0, vocab, (batch, 3, gamma), device="cuda")
-            loss = loss + model.markov_bias(prev_tokens).float().sum()
         loss.backward()
 
         assert torch.isfinite(taps.grad).all()
@@ -296,6 +306,113 @@ def test_block_draft_model_forward_backward(method, tmp_path):
         if method == "dspark":
             assert model.markov_w1.weight.grad is not None
             assert model.markov_w2.weight.grad is not None
+            assert model.confidence_head.weight.grad is not None
+    finally:
+        parallel_state.destroy_model_parallel()
+        if created_process_group and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@requires_gpu_flash
+def test_dspark_hf_checkpoint_roundtrip(tmp_path):
+    """export -> safetensors -> load restores every tensor (markov +
+    confidence heads included) with no missing/unexpected keys."""
+    import torch.distributed as dist
+    from megatron.core import parallel_state
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer import TransformerConfig
+    from safetensors.torch import save_file
+
+    from nemo_rl.models.megatron.draft.dspark import DSparkDraftModel
+    from nemo_rl.models.megatron.draft.utils import (
+        export_block_draft_weights_to_hf,
+        load_hf_weights_to_block_draft,
+    )
+
+    created_process_group = False
+    try:
+        torch.cuda.set_device(0)
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend="nccl",
+                rank=0,
+                world_size=1,
+                init_method=f"file://{tmp_path / 'mcore_pg_init'}",
+            )
+            created_process_group = True
+        parallel_state.destroy_model_parallel()
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+        )
+        model_parallel_cuda_manual_seed(123)
+        torch.manual_seed(7)
+
+        hidden, target_hidden, vocab = 64, 96, 128
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=hidden,
+            ffn_hidden_size=128,
+            num_attention_heads=4,
+            num_query_groups=2,
+            kv_channels=16,
+            normalization="RMSNorm",
+            activation_func=torch.nn.functional.silu,
+            gated_linear_unit=True,
+            add_bias_linear=False,
+            qk_layernorm=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+        )
+        config.vocab_size = vocab
+        config.draft_vocab_size = vocab
+        config.apply_rope_fusion = False
+        config.rotary_base = 10000
+        config.gradient_accumulation_fusion = False
+
+        model = DSparkDraftModel(
+            config=config,
+            gamma=3,
+            mask_token_id=vocab - 1,
+            num_aux_hidden_states=3,
+            target_hidden_size=target_hidden,
+            trunk_chunk=8,
+            markov_rank=8,
+        ).cuda()
+
+        hf_state = dict(export_block_draft_weights_to_hf(model))
+        for key in (
+            "confidence_head.proj.weight",
+            "confidence_head.proj.bias",
+            "markov_head.markov_w1.weight",
+            "markov_head.markov_w2.weight",
+        ):
+            assert key in hf_state, key
+        ckpt_dir = tmp_path / "dspark_ckpt"
+        ckpt_dir.mkdir()
+        save_file(
+            {k: v.contiguous().cpu() for k, v in hf_state.items()},
+            str(ckpt_dir / "model.safetensors"),
+        )
+
+        reference = {
+            k: v.clone()
+            for k, v in model.state_dict().items()
+            if "_extra_state" not in k
+        }
+        with torch.no_grad():
+            for p in model.parameters():
+                p.normal_()
+        missing, unexpected = load_hf_weights_to_block_draft(model, str(ckpt_dir))
+        missing = [k for k in missing if "_extra_state" not in k]
+        unexpected = [k for k in unexpected if "_extra_state" not in k]
+        assert not missing and not unexpected, (missing, unexpected)
+        restored = model.state_dict()
+        for key, ref in reference.items():
+            torch.testing.assert_close(restored[key], ref, rtol=0, atol=0)
     finally:
         parallel_state.destroy_model_parallel()
         if created_process_group and dist.is_initialized():

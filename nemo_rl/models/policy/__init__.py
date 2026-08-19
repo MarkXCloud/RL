@@ -490,8 +490,15 @@ class DraftConfig(TypedDict):
     # w_j = exp(-j / gamma_d), gamma_d tabulated by block size (b8 -> 4,
     # b10 -> 5, b16 -> 7; interpolated otherwise).
     loss_weighting: NotRequired[str | None]
-    # DSpark Markov-head rank.
-    markov_rank: NotRequired[int]
+    # DSpark Markov-head rank. Null = the checkpoint config's markov_rank
+    # (64 for checkpoint-less builds); an explicit value must match the ckpt.
+    markov_rank: NotRequired[int | None]
+    # DSpark loss mix: ce * hard-label CE + tv * TV distillation
+    # + confidence * BCE(confidence head, TV acceptance rate).
+    # Defaults = official dspark_qwen3_8b (0.1 / 0.9 / 1.0).
+    ce_loss_alpha: NotRequired[float]
+    tv_loss_alpha: NotRequired[float]
+    confidence_head_alpha: NotRequired[float]
     # Trunk-attention bucketing granularity in tokens (correctness-neutral).
     trunk_chunk: NotRequired[int]
     # Per-head q/k RMSNorm in the draft attention (Qwen3 style).

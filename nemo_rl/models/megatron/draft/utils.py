@@ -1439,6 +1439,16 @@ def _build_block_draft_model(
     model_name = draft_config.get("model_name")
     hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
     hf_drafter_config = dict(hf_config.get("dflash_config") or {})
+    # Official DSpark configs keep the drafter fields flat at the top level
+    # of config.json (no dflash_config sub-dict); sub-dict keys win.
+    for drafter_key in (
+        "mask_token_id",
+        "target_layer_ids",
+        "block_size",
+        "markov_rank",
+    ):
+        if drafter_key not in hf_drafter_config and drafter_key in hf_config:
+            hf_drafter_config[drafter_key] = hf_config[drafter_key]
 
     # Training implements full non-causal block attention with no sliding
     # window / attention sink and (DSpark) no bonus-anchor slot. A checkpoint
@@ -1531,7 +1541,12 @@ def _build_block_draft_model(
     config.apply_rope_fusion = False
     config.position_embedding_type = "rope"
     config.rotary_percent = model_provider.rotary_percent
-    config.rotary_base = hf_config.get("rope_theta", model_provider.rotary_base)
+    # transformers >= 5 configs nest the theta under rope_parameters.
+    hf_rope_parameters = hf_config.get("rope_parameters") or {}
+    config.rotary_base = hf_config.get(
+        "rope_theta",
+        hf_rope_parameters.get("rope_theta", model_provider.rotary_base),
+    )
     # Official z-lab configs carry an explicit "rope_scaling": null — a
     # present-but-null key must read as "no scaling", not crash on None.get.
     hf_rope_scaling = (hf_config.get("rope_scaling") or {}) if hf_config else None
@@ -1548,6 +1563,18 @@ def _build_block_draft_model(
         raise ValueError(
             f"[draft] mask_token_id={mask_token_id} is outside the vocab "
             f"(vocab_size={config.vocab_size})."
+        )
+
+    # Block width vs the checkpoint (dspark: gamma slots; dflash: gamma + the
+    # bonus anchor slot) — a mismatch would train blocks vLLM never runs.
+    gamma = int(draft_config["gamma"])
+    ckpt_block_size = hf_drafter_config.get("block_size")
+    expected_block_size = gamma if method == "dspark" else gamma + 1
+    if ckpt_block_size is not None and int(ckpt_block_size) != expected_block_size:
+        raise ValueError(
+            f"[draft] policy.draft.gamma={gamma} implies {method} "
+            f"block_size={expected_block_size}, but the checkpoint records "
+            f"block_size={ckpt_block_size}."
         )
 
     aux_layer_ids = [
@@ -1576,7 +1603,7 @@ def _build_block_draft_model(
 
     shared_kwargs = dict(
         config=config,
-        gamma=int(draft_config["gamma"]),
+        gamma=gamma,
         mask_token_id=int(mask_token_id),
         num_aux_hidden_states=len(aux_layer_ids),
         target_hidden_size=model_provider.hidden_size,
@@ -1589,8 +1616,15 @@ def _build_block_draft_model(
     else:
         from nemo_rl.models.megatron.draft.dspark import DSparkDraftModel
 
+        # Checkpoint config wins (its weight shapes must match); the recipe
+        # value only seeds checkpoint-less builds.
+        markov_rank = (
+            hf_drafter_config.get("markov_rank")
+            or draft_config.get("markov_rank")
+            or 64
+        )
         draft_model = DSparkDraftModel(
-            markov_rank=int(draft_config.get("markov_rank") or 64),
+            markov_rank=int(markov_rank),
             **shared_kwargs,
         )
     tp_group = getattr(pg_collection, "tp", None)
@@ -1837,8 +1871,6 @@ _SKIPPED_KEY_SUBSTRINGS = (
     # embed_tokens[mask_token_id] row; a separately-shipped mask embedding
     # (interim checkpoints / trained-mask variants) is ignored.
     "mask_embedding",
-    # Not wired into vLLM inference (its loader skips it too); not trained.
-    "confidence_head",
     # Training-only vocab map of speculators-format checkpoints.
     "t2d",
 )
@@ -1916,6 +1948,12 @@ def load_hf_weights_to_block_draft(
             continue
         if hf_key == "markov_head.markov_w2.weight":
             mapped_state["markov_w2.weight"] = weight
+            continue
+        if hf_key == "confidence_head.proj.weight":
+            mapped_state["confidence_head.weight"] = weight
+            continue
+        if hf_key == "confidence_head.proj.bias":
+            mapped_state["confidence_head.bias"] = weight
             continue
 
         layer_match = _CHECKPOINT_LAYER_KEY_PATTERN.match(hf_key)
@@ -2134,6 +2172,16 @@ def export_block_draft_weights_to_hf(
                     split_axis=0,
                 ),
             )
+        )
+
+    if "confidence_head.weight" in source_state:
+        # vLLM's drafter loader ignores these at refit (it loads the official
+        # ckpt's copies at init and skips them); kept for the HF export.
+        hf_state.append(
+            ("confidence_head.proj.weight", source_state["confidence_head.weight"])
+        )
+        hf_state.append(
+            ("confidence_head.proj.bias", source_state["confidence_head.bias"])
         )
 
     return hf_state

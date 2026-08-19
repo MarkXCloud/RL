@@ -20,7 +20,7 @@ from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
-@patch("nemo_rl.algorithms.loss.wrapper.DraftCrossEntropyLossFn")
+@patch("nemo_rl.algorithms.loss.loss_functions.DraftCrossEntropyLossFn")
 def test_draft_loss_wrapper_combines_policy_and_draft_loss(mock_draft_loss_cls):
     """DraftLossWrapper should add the weighted draft loss to the policy loss."""
     from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
@@ -57,7 +57,7 @@ def test_draft_loss_wrapper_combines_policy_and_draft_loss(mock_draft_loss_cls):
     assert combined_metrics["policy_metric"] == metrics["policy_metric"]
 
 
-@patch("nemo_rl.algorithms.loss.wrapper.DraftCrossEntropyLossFn")
+@patch("nemo_rl.algorithms.loss.loss_functions.DraftCrossEntropyLossFn")
 def test_draft_loss_wrapper_reports_draft_loss_when_weight_is_zero(
     mock_draft_loss_cls,
 ):
@@ -93,7 +93,7 @@ def test_draft_loss_wrapper_reports_draft_loss_when_weight_is_zero(
     assert metrics["draft_loss"] == draft_loss.item()
 
 
-@patch("nemo_rl.algorithms.loss.wrapper.DraftCrossEntropyLossFn")
+@patch("nemo_rl.algorithms.loss.loss_functions.DraftCrossEntropyLossFn")
 def test_draft_loss_wrapper_threads_draft_pass_counts(mock_draft_loss_cls):
     """The wrapper must hand the global per-pass counts to the draft loss fn."""
     from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
@@ -112,7 +112,7 @@ def test_draft_loss_wrapper_threads_draft_pass_counts(mock_draft_loss_cls):
         prepare_fn=prepare_fn,
         data_dict=data,
         loss_weight=1.0,
-        ttt_pass_weights=[1.0, 0.5],
+        draft_loss_kwargs={"pass_weights": [1.0, 0.5]},
         global_draft_pass_counts=draft_pass_counts,
     )
     wrapper(
