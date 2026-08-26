@@ -703,6 +703,7 @@ class TestForwardWithPostProcessingFn:
             # The draft decoder is forced onto the fused causal path (see
             # EagleModel); the forward must pass attention_mask=None.
             attention_mask=None,
+            packed_seq_params=None,
         )
         assert data_dict["student_logits"] is student_logits
 
@@ -767,6 +768,7 @@ class TestForwardWithPostProcessingFn:
         draft_model.forward_ttt.assert_called_once_with(
             hidden_states=hidden_states,
             input_embeds=shifted_embeds,
+            packed_seq_params=None,
         )
         draft_model.assert_not_called()
         assert data_dict["student_logits_by_pass"] is logits_by_pass

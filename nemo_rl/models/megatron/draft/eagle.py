@@ -12,49 +12,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Megatron EAGLE-3 draft model for online co-training.
+"""Megatron training implementation of the EAGLE-3 draft model.
 
-Wraps modelopt's ``EagleModule`` (the reference EAGLE-3 decoder + output head)
-with two training-side additions modelopt does not itself provide:
+This file wraps ModelOpt's ``EagleModule`` and adds two training paths:
 
-- ``forward``: the single-pass path used by ``ttt_steps == 1`` — a plain
-  causal decoder step, one logits tensor per call.
-- ``forward_ttt``: the multi-pass (TTT) path used by ``ttt_steps > 1``, which
-  runs the draft decoder once per pass and feeds each pass's own prediction
-  back in as the next pass's input, mirroring how the draft self-conditions
-  on its own output at serving time.
+- :meth:`EagleModel.forward` runs one causal draft pass when ``ttt_steps == 1``.
+- :meth:`EagleModel.forward_ttt` runs several sequential TTT passes.
+  Each pass feeds its hidden state and shifted token embeddings into the next
+  pass, matching the draft model's self-conditioning during serving.
 
-TTT pass ``d`` (1-indexed) attends to:
+For a query at anchor ``i`` in TTT pass ``d``, attention can read:
 
-- the *trunk*: pass-1 keys/values at positions ``j <= i`` (causal), and
-- the *branch*: the same-anchor diagonal key/value of every later pass
-  ``p in [2, d]`` (including its own pass).
+- the pass-1 trunk at positions ``0..i``; and
+- the entry at anchor ``i`` from every pass ``2..d``.
 
-This mirrors inference, where the draft's KV cache holds the prefill (pass-1)
-entries plus one self-generated entry per speculation depth.
-:class:`TwoPartTTTAttention` has the mask diagram.
+It cannot read a later trunk position or another anchor's branch. This matches
+the serving cache: causal prefill entries followed by one draft-generated entry
+for each speculation depth. :class:`TwoPartTTTAttention` shows the full mask.
 
-The two parts are fused exactly via the standard log-sum-exp merge: the trunk
-runs through the FlashAttention kernel, the branch (at most ``d - 1`` keys per
-query) is a small einsum, and the joint softmax is recovered from the two
-partial (out, lse) pairs. The backward pass feeds the FlashAttention backward
-kernel the *joint* (out, lse) — which yields the exact trunk-restricted
-gradient of the joint softmax (the same mechanism ring attention uses for
-context parallelism) — and computes the branch-restricted gradient in closed
-form.
+The causal trunk uses FlashAttention. The short per-anchor branch uses an
+einsum. Their output and log-sum-exp values are merged to produce the exact
+softmax over both sets of keys; backward uses the same joint values to produce
+the exact gradients.
 
-FlashAttention is called through its private ``_flash_attn_forward`` /
-``_flash_attn_backward`` interface (needed to obtain and feed the lse). The
-call signatures are vendored for flash-attn 2.8.1 (pinned in uv.lock), the
-same pattern ring-flash-attention uses; ``_load_flash_attn`` gates on the
-flash-attn version at import time so a version bump fails loudly.
+Packed and padded inputs share one flat THD code path. With context
+parallelism (CP), queries and branch K/V stay local while pass-1 trunk K/V
+moves around the zigzag ring. Partial attention results are merged at each
+step, and trunk gradients finish by returning to the rank that owns them.
+
+The implementation uses private FlashAttention functions because the merge
+needs their log-sum-exp values. Their interface is pinned to the compatible
+FlashAttention 2.x versions checked below.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Optional, Tuple
 
+import flash_attn
 import torch
+import torch.distributed as dist
+from flash_attn.flash_attn_interface import (
+    _flash_attn_varlen_backward,
+    _flash_attn_varlen_forward,
+)
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.common.embeddings import RotaryEmbedding
@@ -66,71 +67,46 @@ from megatron.core.transformer.utils import (
 )
 from torch import Tensor
 
-_FLASH_ATTN_FUNCS: Optional[
-    tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any]]
-] = None
-
-
-def _load_flash_attn() -> tuple[
-    Callable[..., Any], Callable[..., Any], Callable[..., Any]
-]:
-    """Return ``(flash_attn_func, _flash_attn_forward, _flash_attn_backward)``.
-
-    Deferred import: flash-attn is a GPU-only dependency and must not load on
-    CPU-only paths (unit tests, config validation).
-    """
-    global _FLASH_ATTN_FUNCS
-    if _FLASH_ATTN_FUNCS is not None:
-        return _FLASH_ATTN_FUNCS
-
-    import flash_attn
-    from flash_attn.flash_attn_interface import (
-        _flash_attn_backward,
-        _flash_attn_forward,
-        flash_attn_func,
+# These are private FlashAttention functions, so their Python signatures
+# cannot be inspected reliably. This file uses the interface from version
+# 2.8.1, which is compatible with FlashAttention 2.7 and later 2.x releases.
+# Reject other versions early instead of failing with an unclear argument error.
+_fa_major, _fa_minor = (int(x) for x in flash_attn.__version__.split(".")[:2])
+if not (_fa_major == 2 and _fa_minor >= 7):
+    raise RuntimeError(
+        f"flash-attn {flash_attn.__version__} does not match the private "
+        "interface vendored for flash-attn 2.8.1; update "
+        "nemo_rl/models/megatron/draft/eagle.py."
     )
 
-    # The private call contract this module vendors (split window_size_left/
-    # right args + softcap) exists in flash-attn 2.7-2.x. The functions are
-    # torch custom ops on torch >= 2.4, so their python signature cannot be
-    # introspected — gate on the package version and fail loudly outside the
-    # vendored range instead of passing misaligned positional args.
-    version_parts = flash_attn.__version__.split(".")
-    major, minor = int(version_parts[0]), int(version_parts[1])
-    if not (major == 2 and minor >= 7):
-        raise RuntimeError(
-            f"flash-attn {flash_attn.__version__} does not match the private "
-            "interface vendored for flash-attn 2.8.1; update "
-            "nemo_rl/models/megatron/draft/eagle.py."
-        )
 
-    _FLASH_ATTN_FUNCS = (flash_attn_func, _flash_attn_forward, _flash_attn_backward)
-    return _FLASH_ATTN_FUNCS
-
-
-def _fa_forward_causal(
-    q: Tensor, k: Tensor, v: Tensor, softmax_scale: float
+def _fa_varlen_forward(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_kv: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_kv: int,
+    softmax_scale: float,
+    causal: bool,
 ) -> tuple[Tensor, Tensor]:
-    """Causal FlashAttention forward returning ``(out, lse)``.
+    """Run variable-length FlashAttention on flat THD tensors.
 
-    Args:
-        q: Queries ``[B, S, Hq, D]`` (fp16/bf16).
-        k: Keys ``[B, S, Hkv, D]``.
-        v: Values ``[B, S, Hkv, D]``.
-        softmax_scale: Score scale (``1/sqrt(D)`` convention).
-
-    Returns:
-        ``out`` ``[B, S, Hq, D]`` in the input dtype and ``lse`` ``[B, Hq, S]``
-        in fp32 (natural log).
+    Returns the output with shape ``[T, Hq, D]`` and fp32 log-sum-exp values
+    with shape ``[Hq, T]``.
     """
-    _, fa_fwd, _ = _load_flash_attn()
-    out, softmax_lse, _, _ = fa_fwd(
+    out, softmax_lse, _, _ = _flash_attn_varlen_forward(
         q,
         k,
         v,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        max_seqlen_q,
+        max_seqlen_kv,
         0.0,  # dropout_p
         softmax_scale,
-        True,  # causal
+        causal,
         -1,  # window_size_left
         -1,  # window_size_right
         0.0,  # softcap
@@ -140,7 +116,7 @@ def _fa_forward_causal(
     return out, softmax_lse
 
 
-def _fa_backward_causal(
+def _fa_varlen_backward(
     *,
     dout: Tensor,
     q: Tensor,
@@ -151,15 +127,20 @@ def _fa_backward_causal(
     dq: Tensor,
     dk: Tensor,
     dv: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_kv: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_kv: int,
     softmax_scale: float,
+    causal: bool,
 ) -> None:
-    """Causal FlashAttention backward writing into preallocated ``dq/dk/dv``.
+    """Run variable-length FlashAttention backward into existing buffers.
 
-    Feeding the *joint* ``(out, lse)`` makes the kernel return the exact
-    trunk-restricted gradient of the joint two-part softmax.
+    ``out`` and ``lse`` describe attention over all merged key sets. Passing
+    them to this call produces the exact part of that joint-softmax gradient
+    that belongs to this call's keys.
     """
-    _, _, fa_bwd = _load_flash_attn()
-    fa_bwd(
+    _flash_attn_varlen_backward(
         dout,
         q,
         k,
@@ -169,9 +150,13 @@ def _fa_backward_causal(
         dq,
         dk,
         dv,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        max_seqlen_q,
+        max_seqlen_kv,
         0.0,  # dropout_p
         softmax_scale,
-        True,  # causal
+        causal,
         -1,  # window_size_left
         -1,  # window_size_right
         0.0,  # softcap
@@ -181,18 +166,109 @@ def _fa_backward_causal(
     )
 
 
-class TwoPartTTTAttention(torch.autograd.Function):
-    """Exact joint attention over a causal trunk plus per-anchor branch keys.
+def _global_cp_group() -> Optional[dist.ProcessGroup]:
+    """The global CP group, or None before model-parallel init (unit tests)."""
+    if not parallel_state.model_parallel_is_initialized():
+        return None
+    return parallel_state.get_context_parallel_group()
 
-    The mask (never materialized), for ``S = 4`` positions and ``K = 3`` TTT
-    passes. Teacher forcing makes every position an anchor, so pass ``d`` is
-    one decoder forward whose query at anchor ``i`` replays depth ``d`` of the
-    speculation chain rooted at ``i``. Row block ``d`` below holds that pass's
-    queries: block 1 is the plain causal FlashAttention call in
-    :class:`TTTDraftCoreAttention` (drawn to complete the picture); each later
-    block is one ``TwoPartTTTAttention`` call. ``A`` keys ride the causal
-    FlashAttention kernel (part one), ``x`` keys the small fp32 einsum
-    (part two)::
+
+def _zigzag_half_split(cu_seqlens: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """Split every local zigzag subsequence into its front and back halves.
+
+    A CP rank stores two equally sized chunks from each global subsequence.
+    Rank ``r`` owns front chunk ``r`` and back chunk ``2 * cp_size - 1 - r``.
+
+    Args:
+        cu_seqlens: Boundaries of the rank-local THD subsequences.
+
+    Returns:
+        Indices of all front rows, indices of all back rows, and THD
+        boundaries for a tensor containing one half of each subsequence.
+    """
+    device = cu_seqlens.device
+    lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
+    half = lens // 2
+    total = int(cu_seqlens[-1].item())
+    seq_id = torch.repeat_interleave(torch.arange(lens.numel(), device=device), lens)
+    pos_local = (
+        torch.arange(total, device=device) - cu_seqlens[:-1].to(torch.long)[seq_id]
+    )
+    front_mask = pos_local < half[seq_id]
+    front_index = front_mask.nonzero(as_tuple=True)[0]
+    back_index = (~front_mask).nonzero(as_tuple=True)[0]
+    cu_half = torch.zeros_like(cu_seqlens)
+    cu_half[1:] = torch.cumsum(half, dim=0).to(cu_seqlens.dtype)
+    return front_index, back_index, cu_half
+
+
+def _ring_send_recv(
+    tensors: list[Tensor],
+    send_rank: int,
+    recv_rank: int,
+    cp_group: dist.ProcessGroup,
+) -> tuple[list[Tensor], list[Any]]:
+    """Move a list of tensors one step around the CP ring.
+
+    Each tensor is sent to the next rank while a same-shaped tensor is received
+    from the previous rank. The caller must keep the sent tensors alive until
+    all returned requests have completed.
+    """
+    recvs = [torch.empty_like(t) for t in tensors]
+    ops = []
+    for send_t, recv_t in zip(tensors, recvs):
+        ops.append(dist.P2POp(dist.isend, send_t.contiguous(), send_rank, cp_group))
+        ops.append(dist.P2POp(dist.irecv, recv_t, recv_rank, cp_group))
+    return recvs, dist.batch_isend_irecv(ops)
+
+
+def _lse_merge_update(
+    out_acc: Tensor,
+    lse_acc: Tensor,
+    out_step: Tensor,
+    lse_step: Tensor,
+    rows: Optional[Tensor] = None,
+) -> None:
+    """Merge attention over another set of keys into fp32 accumulators.
+
+    ``out_step`` is normalized only over the keys handled by this step. Its
+    log-sum-exp value supplies the exact weight needed to combine it with the
+    earlier results. The accumulators start at 0 and ``-inf``, so the first
+    merge acts like a copy. ``rows`` limits the merge when only the local back
+    half contains valid queries.
+    """
+    if rows is None:
+        lse_new = torch.logaddexp(lse_acc, lse_step)
+        w_old = torch.exp(lse_acc - lse_new).transpose(0, 1).unsqueeze(-1)
+        w_new = torch.exp(lse_step - lse_new).transpose(0, 1).unsqueeze(-1)
+        out_acc.mul_(w_old).add_(out_step.float() * w_new)
+        lse_acc.copy_(lse_new)
+    else:
+        lse_old = lse_acc[:, rows]
+        lse_new = torch.logaddexp(lse_old, lse_step)
+        w_old = torch.exp(lse_old - lse_new).transpose(0, 1).unsqueeze(-1)
+        w_new = torch.exp(lse_step - lse_new).transpose(0, 1).unsqueeze(-1)
+        out_acc[rows] = out_acc[rows] * w_old + out_step.float() * w_new
+        lse_acc[:, rows] = lse_new
+
+
+class TwoPartTTTAttention(torch.autograd.Function):
+    """Combine a causal pass-1 trunk with each anchor's own branch keys.
+
+    In TTT pass ``d``, the query at anchor ``i`` can attend to:
+
+    - pass-1 trunk keys at positions ``0..i``; and
+    - the key at anchor ``i`` from every pass ``2..d``.
+
+    It cannot attend to later trunk positions or branch keys from another
+    anchor. Teacher forcing treats every sequence position as an independent
+    anchor, so all anchors from one pass can be processed together.
+
+    The example below has four anchors and three passes. ``q2@1`` means the
+    query for anchor 1 during pass 2. ``A`` marks trunk attention computed by
+    FlashAttention, ``x`` marks the small same-anchor branch computed by an
+    fp32 einsum, and blank cells are masked. Each group of query rows is one
+    :class:`TwoPartTTTAttention` call; pass 1 has no branch::
 
                  | pass-1 KV(trunk) |    pass-2 KV    |    pass-3 KV    |
        anchor j: |  0   1   2   3   |  0   1   2   3  |  0   1   2   3  |
@@ -213,38 +289,58 @@ class TwoPartTTTAttention(torch.autograd.Function):
        q3@3      |  A   A   A   A   |              x  |              x  |
        ==================================================================
 
-    A pass-``d`` query at anchor ``i`` sees the trunk causally *including*
-    ``i`` and, in each pass group ``p in [2, d]``, only its own anchor's
-    diagonal entry — never another anchor's branch, never a later trunk
-    position. Chains rooted at different anchors share nothing but the trunk,
-    which is what lets all ``S`` anchors of a pass run as one kernel call. In
-    RoPE terms the union key set of ``q_d@i`` covers positions ``0..i``
-    (trunk) then ``i+1 .. i+d-1`` (branch diagonals, own key last) with the
-    query itself at ``i+d-1`` — exactly the KV cache state of the depth-``d``
-    speculation step at serving: prefill entries plus the ``d-1`` entries the
-    draft generated itself.
+    The RoPE positions follow the serving cache. For ``q_d@i``, the trunk uses
+    positions ``0..i`` and branch keys use ``i+1..i+d-1``. The query and its
+    current-pass key both use ``i+d-1``. Thus the cache contains the causal
+    prefill plus the ``d - 1`` entries generated by this speculation chain.
 
-    Per pass ``d``, anchor ``i`` (``EagleModel.forward_ttt`` is the driver;
-    ``DraftCrossEntropyLossFn`` applies the shifts)::
+    For pass ``d`` and anchor ``i``:
 
-        input   concat(e(x_{i+d}), h^{d-1}_i)    h^0 = fc(target aux taps),
-                                                 h^p = pass-p pre-norm hidden
-        RoPE    i + d - 1
-        target  x_{i+d+1}   (teacher: the policy's logits at i + d)
-        stash   (k^d_i, v^d_i) -> the next pass's newest branch column
+    - Input: ``concat(e(x_{i+d}), h^{d-1}_i)``. Here ``h^0`` is the projected
+      target auxiliary state, and later ``h`` values are pre-norm draft states.
+    - RoPE position: ``i + d - 1``.
+    - Training target: ``x_{i+d+1}``.
+    - Saved state: ``(k^d_i, v^d_i)``, which becomes a branch entry for the
+      next pass.
 
-    Inputs are batch-first (FlashAttention layout):
+    The trunk and branch are evaluated separately, then merged with their
+    log-sum-exp values. This gives the exact softmax over the union of keys
+    without creating a ``T x T`` score matrix. Backward passes the merged
+    output and log-sum-exp to FlashAttention for the trunk and computes the
+    branch gradient directly.
 
-    - ``q``: pass-d queries ``[B, S, Hq, D]``
-    - ``k1``/``v1``: pass-1 (trunk) keys/values ``[B, S, Hkv, D]``
-    - ``kb``/``vb``: branch keys/values ``[B, S, Hkv, P, D]`` where slot ``p``
-      holds the pass-(p+2) diagonal entry for the same anchor position
-      (``P = d - 1``, including pass d itself).
+    Inputs to ``apply`` use flat THD layout:
 
-    The output equals softmax over the union key set
-    ``{k1[:, :i+1]} ∪ {kb[:, i, :, p] for all p}`` per query ``i`` — i.e. the
-    dense staircase mask — computed without materializing any ``S x S`` score
-    matrix.
+    - ``q``: Current-pass queries with shape ``[T, Hq, D]``.
+    - ``k1`` and ``v1``: Pass-1 trunk K/V with shape ``[T, Hkv, D]``.
+    - ``kb`` and ``vb``: Branch K/V with shape ``[T, Hkv, P, D]``. The branch
+      axis stores passes ``2..d`` for the same local anchor, so ``P = d - 1``.
+      Both tensors are ``None`` during pass 1.
+    - ``cu_seqlens``: Rank-local subsequence boundaries with shape ``[N + 1]``.
+    - ``max_seqlen``: Maximum rank-local subsequence length.
+    - ``softmax_scale``: Scale applied to attention scores.
+    - ``cp_group``: CP process group, or ``None`` on a single rank.
+
+    Packing boundaries are respected by variable-length FlashAttention. The
+    causal trunk restarts at every subsequence, while each branch stays at one
+    local row and therefore cannot cross into another subsequence. Padded input
+    is converted to ``B`` equal-length THD subsequences by the caller.
+
+    With CP, rank ``r`` owns a front chunk ``r`` and a back chunk
+    ``2 * cp_size - 1 - r`` from every subsequence. Queries remain local while
+    trunk K/V moves around the ring. Each ring step uses one of three masks:
+
+    - Step 0 uses causal attention over this rank's concatenated front and back
+      chunks.
+    - At steps ``s <= r``, all local queries see the arriving front chunk and
+      none see its back chunk.
+    - At steps ``s > r``, only local back-chunk queries see the entire arriving
+      K/V shard.
+
+    The local branch is merged as one additional step. Backward replays the
+    ring, and trunk K/V gradients make a final hop back to their owner rank.
+
+    The returned tensor has shape ``[T, Hq, D]``.
     """
 
     @staticmethod
@@ -253,149 +349,346 @@ class TwoPartTTTAttention(torch.autograd.Function):
         q: Tensor,
         k1: Tensor,
         v1: Tensor,
-        kb: Tensor,
-        vb: Tensor,
+        kb: Optional[Tensor],
+        vb: Optional[Tensor],
+        cu_seqlens: Tensor,
+        max_seqlen: int,
         softmax_scale: float,
+        cp_group: Optional[dist.ProcessGroup],
     ) -> Tensor:
-        batch, seqlen, num_q_heads, head_dim = q.shape
-        num_kv_heads = k1.shape[2]
+        total, num_q_heads, head_dim = q.shape
+        num_kv_heads = k1.shape[1]
         group = num_q_heads // num_kv_heads
+        has_branch = kb is not None
 
-        out_t, lse_t = _fa_forward_causal(q, k1, v1, softmax_scale)
+        cp_size = 1 if cp_group is None else cp_group.size()
+        if cp_size > 1:
+            cp_rank = cp_group.rank()
+            global_ranks = dist.get_process_group_ranks(cp_group)
+            send_rank = global_ranks[(cp_rank + 1) % cp_size]
+            recv_rank = global_ranks[(cp_rank - 1) % cp_size]
+            front_index, back_index, cu_half = _zigzag_half_split(cu_seqlens)
+            max_half = max(max_seqlen // 2, 1)
+            q_back = q[back_index]
+        else:
+            cp_rank = 0
+            front_index = back_index = cu_half = None
 
-        # Branch part in fp32: scores/probs over at most P keys per query.
-        q_grouped = q.view(batch, seqlen, num_kv_heads, group, head_dim).float()
-        # [B, S, Hkv, G, P]
-        scores_b = (
-            torch.einsum("bskgd,bskpd->bskgp", q_grouped, kb.float()) * softmax_scale
-        )
-        lse_b = torch.logsumexp(scores_b, dim=-1)  # [B, S, Hkv, G]
-        probs_b = torch.exp(scores_b - lse_b.unsqueeze(-1))
-        out_b = torch.einsum("bskgp,bskpd->bskgd", probs_b, vb.float())
+        out_acc = q.new_zeros((total, num_q_heads, head_dim), dtype=torch.float32)
+        lse_acc = q.new_full((num_q_heads, total), float("-inf"), dtype=torch.float32)
 
-        # Exact LSE merge of the two disjoint key sets.
-        lse_t_grouped = (
-            lse_t.permute(0, 2, 1).view(batch, seqlen, num_kv_heads, group).float()
-        )
-        lse_joint = torch.logaddexp(lse_t_grouped, lse_b)  # [B, S, Hkv, G]
-        w_t = torch.exp(lse_t_grouped - lse_joint).unsqueeze(-1)
-        w_b = torch.exp(lse_b - lse_joint).unsqueeze(-1)
-        out_f32 = (
-            w_t * out_t.view(batch, seqlen, num_kv_heads, group, head_dim).float()
-            + w_b * out_b
-        )
-        out = out_f32.view(batch, seqlen, num_q_heads, head_dim).to(q.dtype)
+        k_cur, v_cur = k1, v1
+        reqs: list[Any] = []
+        for step in range(cp_size):
+            if step + 1 < cp_size:
+                (k_next, v_next), reqs = _ring_send_recv(
+                    [k_cur, v_cur], send_rank, recv_rank, cp_group
+                )
+            if step == 0:
+                out_s, lse_s = _fa_varlen_forward(
+                    q,
+                    k_cur,
+                    v_cur,
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_seqlen,
+                    max_seqlen,
+                    softmax_scale,
+                    causal=True,
+                )
+                _lse_merge_update(out_acc, lse_acc, out_s, lse_s)
+            elif step <= cp_rank:
+                out_s, lse_s = _fa_varlen_forward(
+                    q,
+                    k_cur[front_index],
+                    v_cur[front_index],
+                    cu_seqlens,
+                    cu_half,
+                    max_seqlen,
+                    max_half,
+                    softmax_scale,
+                    causal=False,
+                )
+                _lse_merge_update(out_acc, lse_acc, out_s, lse_s)
+            else:
+                out_s, lse_s = _fa_varlen_forward(
+                    q_back,
+                    k_cur,
+                    v_cur,
+                    cu_half,
+                    cu_seqlens,
+                    max_half,
+                    max_seqlen,
+                    softmax_scale,
+                    causal=False,
+                )
+                _lse_merge_update(out_acc, lse_acc, out_s, lse_s, rows=back_index)
+            if step + 1 < cp_size:
+                for req in reqs:
+                    req.wait()
+                k_cur, v_cur = k_next, v_next
 
-        # FlashAttention backward expects lse as [B, Hq, S] fp32.
-        lse_joint_hbs = (
-            lse_joint.view(batch, seqlen, num_q_heads).permute(0, 2, 1).contiguous()
-        )
+        if has_branch:
+            # Each query has at most P branch keys, so compute this small part
+            # directly in fp32.
+            q_grouped = q.view(total, num_kv_heads, group, head_dim).float()
+            scores_b = (
+                torch.einsum("tkgd,tkpd->tkgp", q_grouped, kb.float()) * softmax_scale
+            )
+            lse_b = torch.logsumexp(scores_b, dim=-1)  # [T, Hkv, G]
+            probs_b = torch.exp(scores_b - lse_b.unsqueeze(-1))
+            out_b = torch.einsum("tkgp,tkpd->tkgd", probs_b, vb.float())
 
-        ctx.save_for_backward(q, k1, v1, kb, vb, out, lse_joint_hbs)
+            # Merge in place. An einsum result may have a permuted KV-major
+            # layout; replacing ``out_acc`` with a broadcast expression could
+            # inherit that layout and break the final view.
+            lse_t = lse_acc.transpose(0, 1).reshape(total, num_kv_heads, group)
+            lse_joint = torch.logaddexp(lse_t, lse_b)
+            w_t = torch.exp(lse_t - lse_joint).unsqueeze(-1)
+            w_b = torch.exp(lse_b - lse_joint).unsqueeze(-1)
+            out_acc_grouped = out_acc.view(total, num_kv_heads, group, head_dim)
+            out_acc_grouped.mul_(w_t).add_(w_b * out_b)
+            out = out_acc.view(total, num_q_heads, head_dim).to(q.dtype)
+            # FlashAttention backward expects fp32 LSE in [Hq, T] layout.
+            lse_final = lse_joint.view(total, num_q_heads).transpose(0, 1).contiguous()
+        else:
+            out = out_acc.to(q.dtype)
+            lse_final = lse_acc
+
+        saved = [q, k1, v1, out, lse_final, cu_seqlens]
+        if has_branch:
+            saved += [kb, vb]
+        if cp_size > 1:
+            saved += [front_index, back_index, cu_half]
+        ctx.save_for_backward(*saved)
+        ctx.has_branch = has_branch
         ctx.softmax_scale = softmax_scale
+        ctx.cp_group = cp_group
+        ctx.cp_size = cp_size
+        ctx.max_seqlen = max_seqlen
         return out
 
     @staticmethod
     def backward(  # type: ignore[override]
         ctx: Any, dout: Tensor
     ) -> tuple[Optional[Tensor], ...]:
-        q, k1, v1, kb, vb, out, lse_joint_hbs = ctx.saved_tensors
+        saved = list(ctx.saved_tensors)
+        q, k1, v1, out, lse_joint, cu_seqlens = saved[:6]
+        cursor = 6
+        if ctx.has_branch:
+            kb, vb = saved[cursor : cursor + 2]
+            cursor += 2
+        if ctx.cp_size > 1:
+            front_index, back_index, cu_half = saved[cursor : cursor + 3]
+        cp_group = ctx.cp_group
+        cp_size = ctx.cp_size
         softmax_scale = ctx.softmax_scale
-        batch, seqlen, num_q_heads, head_dim = q.shape
-        num_kv_heads = k1.shape[2]
+        max_seqlen = ctx.max_seqlen
+
+        total, num_q_heads, head_dim = q.shape
+        num_kv_heads = k1.shape[1]
         group = num_q_heads // num_kv_heads
 
         dout = dout.contiguous()
+        # Accumulate K/V gradients in fp32 while they travel with their shard;
+        # each FlashAttention call returns lower-precision step gradients.
+        dq_acc = q.new_zeros((total, num_q_heads, head_dim), dtype=torch.float32)
+        dk_cur = q.new_zeros(k1.shape, dtype=torch.float32)
+        dv_cur = torch.zeros_like(dk_cur)
 
-        # Trunk gradient: FA backward with the joint (out, lse) returns the
-        # exact joint-softmax gradient restricted to the trunk key set.
-        dq_t = torch.empty_like(q)
-        dk1 = torch.empty_like(k1)
-        dv1 = torch.empty_like(v1)
-        _fa_backward_causal(
-            dout=dout,
-            q=q,
-            k=k1,
-            v=v1,
-            out=out,
-            lse=lse_joint_hbs,
-            dq=dq_t,
-            dk=dk1,
-            dv=dv1,
-            softmax_scale=softmax_scale,
-        )
+        if cp_size > 1:
+            cp_rank = cp_group.rank()
+            global_ranks = dist.get_process_group_ranks(cp_group)
+            send_rank = global_ranks[(cp_rank + 1) % cp_size]
+            recv_rank = global_ranks[(cp_rank - 1) % cp_size]
+            max_half = max(max_seqlen // 2, 1)
+            q_back = q[back_index]
+            dout_back = dout[back_index]
+            out_back = out[back_index]
+            lse_back = lse_joint[:, back_index].contiguous()
+        else:
+            cp_rank = 0
 
-        # Branch gradient in closed form (fp32): probs are joint-normalized,
-        # and the D_i = rowsum(dout * out_joint) term carries the cross-part
-        # softmax correction (same identity the FA kernel applies internally).
-        q_grouped = q.view(batch, seqlen, num_kv_heads, group, head_dim).float()
-        scores_b = (
-            torch.einsum("bskgd,bskpd->bskgp", q_grouped, kb.float()) * softmax_scale
-        )
-        lse_joint_grouped = (
-            lse_joint_hbs.permute(0, 2, 1)
-            .reshape(batch, seqlen, num_kv_heads, group)
-            .float()
-        )
-        probs_bj = torch.exp(scores_b - lse_joint_grouped.unsqueeze(-1))
+        # Replay the forward ring. Add each step's K/V gradient before moving
+        # the shard and its accumulator together. A final hop returns the full
+        # gradient to the rank that owns the shard.
+        k_cur, v_cur = k1, v1
+        for step in range(cp_size):
+            kv_reqs: list[Any] = []
+            if step + 1 < cp_size:
+                (k_next, v_next), kv_reqs = _ring_send_recv(
+                    [k_cur, v_cur], send_rank, recv_rank, cp_group
+                )
+            if step == 0:
+                dq_s = torch.empty_like(q)
+                dk_s = torch.empty_like(k_cur)
+                dv_s = torch.empty_like(v_cur)
+                _fa_varlen_backward(
+                    dout=dout,
+                    q=q,
+                    k=k_cur,
+                    v=v_cur,
+                    out=out,
+                    lse=lse_joint,
+                    dq=dq_s,
+                    dk=dk_s,
+                    dv=dv_s,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_kv=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_kv=max_seqlen,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                )
+                dq_acc += dq_s.float()
+                dk_cur += dk_s.float()
+                dv_cur += dv_s.float()
+            elif step <= cp_rank:
+                k_half = k_cur[front_index]
+                v_half = v_cur[front_index]
+                dq_s = torch.empty_like(q)
+                dk_s = torch.empty_like(k_half)
+                dv_s = torch.empty_like(v_half)
+                _fa_varlen_backward(
+                    dout=dout,
+                    q=q,
+                    k=k_half,
+                    v=v_half,
+                    out=out,
+                    lse=lse_joint,
+                    dq=dq_s,
+                    dk=dk_s,
+                    dv=dv_s,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_kv=cu_half,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_kv=max_half,
+                    softmax_scale=softmax_scale,
+                    causal=False,
+                )
+                dq_acc += dq_s.float()
+                dk_cur.index_add_(0, front_index, dk_s.float())
+                dv_cur.index_add_(0, front_index, dv_s.float())
+            else:
+                dq_s = torch.empty_like(q_back)
+                dk_s = torch.empty_like(k_cur)
+                dv_s = torch.empty_like(v_cur)
+                _fa_varlen_backward(
+                    dout=dout_back,
+                    q=q_back,
+                    k=k_cur,
+                    v=v_cur,
+                    out=out_back,
+                    lse=lse_back,
+                    dq=dq_s,
+                    dk=dk_s,
+                    dv=dv_s,
+                    cu_seqlens_q=cu_half,
+                    cu_seqlens_kv=cu_seqlens,
+                    max_seqlen_q=max_half,
+                    max_seqlen_kv=max_seqlen,
+                    softmax_scale=softmax_scale,
+                    causal=False,
+                )
+                dq_acc.index_add_(0, back_index, dq_s.float())
+                dk_cur += dk_s.float()
+                dv_cur += dv_s.float()
+            if step + 1 < cp_size:
+                for req in kv_reqs:
+                    req.wait()
+                # Move gradients only after adding this step's contribution.
+                (dk_next, dv_next), dkv_reqs = _ring_send_recv(
+                    [dk_cur, dv_cur], send_rank, recv_rank, cp_group
+                )
+                for req in dkv_reqs:
+                    req.wait()
+                k_cur, v_cur = k_next, v_next
+                dk_cur, dv_cur = dk_next, dv_next
+        if cp_size > 1:
+            (dk_own, dv_own), dkv_reqs = _ring_send_recv(
+                [dk_cur, dv_cur], send_rank, recv_rank, cp_group
+            )
+            for req in dkv_reqs:
+                req.wait()
+            dk_cur, dv_cur = dk_own, dv_own
 
-        dout_f32 = dout.float()
-        d_row = (
-            (dout_f32 * out.float())
-            .sum(dim=-1)
-            .view(batch, seqlen, num_kv_heads, group)
-        )
-        dout_grouped = dout_f32.view(batch, seqlen, num_kv_heads, group, head_dim)
+        if ctx.has_branch:
+            # Compute the branch gradient directly in fp32. ``probs_bj`` uses
+            # the joint normalization, and ``d_row`` supplies the correction
+            # caused by sharing one softmax with the trunk.
+            q_grouped = q.view(total, num_kv_heads, group, head_dim).float()
+            scores_b = (
+                torch.einsum("tkgd,tkpd->tkgp", q_grouped, kb.float()) * softmax_scale
+            )
+            lse_joint_grouped = (
+                lse_joint.transpose(0, 1).reshape(total, num_kv_heads, group).float()
+            )
+            probs_bj = torch.exp(scores_b - lse_joint_grouped.unsqueeze(-1))
 
-        dvb = torch.einsum("bskgp,bskgd->bskpd", probs_bj, dout_grouped)
-        d_probs = torch.einsum("bskgd,bskpd->bskgp", dout_grouped, vb.float())
-        d_scores = probs_bj * (d_probs - d_row.unsqueeze(-1)) * softmax_scale
-        dq_b = torch.einsum("bskgp,bskpd->bskgd", d_scores, kb.float()).view(
-            batch, seqlen, num_q_heads, head_dim
-        )
-        dkb = torch.einsum("bskgp,bskgd->bskpd", d_scores, q_grouped)
+            dout_f32 = dout.float()
+            d_row = (
+                (dout_f32 * out.float()).sum(dim=-1).view(total, num_kv_heads, group)
+            )
+            dout_grouped = dout_f32.view(total, num_kv_heads, group, head_dim)
 
-        dq = (dq_t.float() + dq_b).to(q.dtype)
-        return dq, dk1, dv1, dkb.to(kb.dtype), dvb.to(vb.dtype), None
+            dvb = torch.einsum("tkgp,tkgd->tkpd", probs_bj, dout_grouped)
+            d_probs = torch.einsum("tkgd,tkpd->tkgp", dout_grouped, vb.float())
+            d_scores = probs_bj * (d_probs - d_row.unsqueeze(-1)) * softmax_scale
+            # Use reshape because einsum may return a permuted layout.
+            dq_acc += torch.einsum("tkgp,tkpd->tkgd", d_scores, kb.float()).reshape(
+                total, num_q_heads, head_dim
+            )
+            dkb = torch.einsum("tkgp,tkgd->tkpd", d_scores, q_grouped).to(kb.dtype)
+            dvb = dvb.to(vb.dtype)
+        else:
+            dkb = dvb = None
+
+        return (
+            dq_acc.to(q.dtype),
+            dk_cur.to(k1.dtype),
+            dv_cur.to(v1.dtype),
+            dkb,
+            dvb,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 class TTTDraftCoreAttention(torch.nn.Module):
-    """Drop-in ``core_attention`` for the draft decoder's multi-pass training.
+    """Adapt MCore self-attention to the multi-pass TTT mask.
 
-    Replaces the layer's TE core attention (see ``EagleModel``); receives the
-    post-RoPE q/k/v that MCore's ``SelfAttention.forward`` hands to
-    ``core_attention`` in sbhd layout and returns ``[S, B, Hq * D]``.
+    This module replaces each draft decoder layer's TE core attention. MCore
+    passes Q/K/V after RoPE in one of two layouts:
 
-    Statefulness contract: the TTT driver calls :meth:`begin_pass` before each
-    draft decoder pass and :meth:`reset` when the multi-pass loop finishes (or
-    aborts). Pass 1 runs plain causal FlashAttention and stashes its KV
-    (non-detached — cross-pass reuse must carry gradients back to the pass-1
-    projections); later passes stash their own KV as branch entries and run
-    :class:`TwoPartTTTAttention` against the trunk. Because the stash holds
-    the exact tensors fed to the kernels, a single backward over the combined
-    loss accumulates every pass's contribution automatically.
+    - padded: ``[S, B, H, D]``;
+    - packed THD: ``[T, H, D]``, with the batch dimension removed.
+
+    The returned layouts are ``[S, B, Hq * D]`` and ``[T, Hq * D]``.
+
+    The module keeps K/V from earlier passes. :meth:`begin_pass` selects the
+    current pass. Pass 1 becomes the causal trunk; later passes are appended as
+    branch entries. These tensors are not detached because later-pass losses
+    must also update the projections that created earlier K/V. :meth:`reset`
+    clears all saved tensors after the TTT loop, including error paths.
+
+    ``pg_collection`` supplies the CP process group. Multiple CP ranks require
+    packed THD input because padded input has no zigzag position metadata.
     """
 
     def __init__(self, config: Any):
         super().__init__()
-        attention_dropout = float(getattr(config, "attention_dropout", 0.0) or 0.0)
-        if attention_dropout != 0.0:
-            raise ValueError(
-                "TTTDraftCoreAttention does not support attention dropout "
-                f"(got attention_dropout={attention_dropout})."
-            )
-        if int(getattr(config, "context_parallel_size", 1) or 1) != 1:
-            raise ValueError(
-                "TTTDraftCoreAttention requires context_parallel_size == 1."
-            )
-        # Match MCore's DotProductAttention convention: explicit config
-        # softmax_scale, else 1/sqrt(head_dim).
+        # Match MCore: use the configured scale, or default to 1 / sqrt(D).
         self.softmax_scale: Optional[float] = getattr(config, "softmax_scale", None)
+        # ``build_draft_model`` injects this collection. The draft module itself
+        # is replicated rather than sharded across CP ranks.
+        self.pg_collection: Optional[Any] = None
         self._pass_idx = 0
         self._kv_by_pass: list[tuple[Tensor, Tensor]] = []
 
     def begin_pass(self, pass_idx: int) -> None:
-        """Arm the module for TTT pass ``pass_idx`` (1-indexed)."""
+        """Start the one-indexed TTT pass ``pass_idx``."""
         if pass_idx == 1:
             self._kv_by_pass = []
         elif pass_idx != self._pass_idx + 1:
@@ -406,9 +699,15 @@ class TTTDraftCoreAttention(torch.nn.Module):
         self._pass_idx = pass_idx
 
     def reset(self) -> None:
-        """Drop stashed KV references (frees the autograd graph between steps)."""
+        """Clear saved K/V and release the cross-pass autograd graph."""
         self._pass_idx = 0
         self._kv_by_pass = []
+
+    def _cp_group(self) -> Optional[dist.ProcessGroup]:
+        group = getattr(self.pg_collection, "cp", None)
+        if group is None or group.size() == 1:
+            return None
+        return group
 
     def forward(
         self,
@@ -420,52 +719,77 @@ class TTTDraftCoreAttention(torch.nn.Module):
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[Any] = None,
     ) -> Tensor:
-        if packed_seq_params is not None:
-            raise NotImplementedError(
-                "TTT draft training does not support sequence packing; "
-                "disable policy.sequence_packing."
-            )
-        if attention_bias is not None:
-            raise NotImplementedError(
-                "TTT draft training does not support attention_bias."
-            )
-        if attention_mask is not None:
-            raise ValueError(
-                "TTTDraftCoreAttention builds its own causal/branch masking; "
-                "pass attention_mask=None (see EagleModel.forward)."
-            )
         if self._pass_idx < 1:
             raise RuntimeError(
                 "TTTDraftCoreAttention.forward called without begin_pass(); "
                 "the TTT driver must arm the pass index before each pass."
             )
 
-        seqlen, batch = query.shape[0], query.shape[1]
+        cp_group = self._cp_group()
         softmax_scale = self.softmax_scale or query.shape[-1] ** -0.5
 
-        # sbhd -> bshd (FlashAttention layout).
-        q = query.transpose(0, 1).contiguous()
-        k = key.transpose(0, 1).contiguous()
-        v = value.transpose(0, 1).contiguous()
+        if packed_seq_params is not None:
+            if getattr(packed_seq_params, "qkv_format", None) != "thd":
+                raise NotImplementedError(
+                    "TTT draft training supports packed sequences only in "
+                    f"'thd' format, got {getattr(packed_seq_params, 'qkv_format', None)!r}."
+                )
+            # MCore removes the singleton batch dimension in THD mode.
+            q, k, v = query, key, value
+            cu_global = packed_seq_params.cu_seqlens_q_padded
+            if cu_global is None:
+                cu_global = packed_seq_params.cu_seqlens_q
+            cp_size = 1 if cp_group is None else cp_group.size()
+            cu_local = torch.div(cu_global, cp_size, rounding_mode="floor").to(
+                torch.int32
+            )
+            max_local = int(packed_seq_params.max_seqlen_q) // cp_size
+            packed = True
+        else:
+            if cp_group is not None:
+                raise NotImplementedError(
+                    "Context-parallel TTT draft training requires sequence "
+                    "packing (THD input); enable policy.sequence_packing."
+                )
+            # Treat a padded batch as B equal-length THD subsequences.
+            seqlen, batch = query.shape[0], query.shape[1]
+            q = (
+                query.transpose(0, 1)
+                .contiguous()
+                .view(batch * seqlen, *query.shape[2:])
+            )
+            k = key.transpose(0, 1).contiguous().view(batch * seqlen, *key.shape[2:])
+            v = (
+                value.transpose(0, 1)
+                .contiguous()
+                .view(batch * seqlen, *value.shape[2:])
+            )
+            cu_local = (
+                torch.arange(0, batch + 1, device=query.device, dtype=torch.int32)
+                * seqlen
+            )
+            max_local = seqlen
+            packed = False
 
         self._kv_by_pass.append((k, v))
-        if len(self._kv_by_pass) != self._pass_idx:
-            raise RuntimeError(
-                f"TTT pass bookkeeping out of sync: pass {self._pass_idx} but "
-                f"{len(self._kv_by_pass)} stashed KV entries."
-            )
 
         if self._pass_idx == 1:
-            flash_attn_func, _, _ = _load_flash_attn()
-            out = flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=True)
+            out = TwoPartTTTAttention.apply(
+                q, k, v, None, None, cu_local, max_local, softmax_scale, cp_group
+            )
         else:
             k1, v1 = self._kv_by_pass[0]
-            kb = torch.stack([kv[0] for kv in self._kv_by_pass[1:]], dim=3)
-            vb = torch.stack([kv[1] for kv in self._kv_by_pass[1:]], dim=3)
-            out = TwoPartTTTAttention.apply(q, k1, v1, kb, vb, softmax_scale)
+            kb = torch.stack([kv[0] for kv in self._kv_by_pass[1:]], dim=2)
+            vb = torch.stack([kv[1] for kv in self._kv_by_pass[1:]], dim=2)
+            out = TwoPartTTTAttention.apply(
+                q, k1, v1, kb, vb, cu_local, max_local, softmax_scale, cp_group
+            )
 
-        # bshd -> [S, B, Hq * D] (core_attention output contract).
-        return out.transpose(0, 1).reshape(seqlen, batch, -1)
+        if packed:
+            # MCore expects [T, Hq * D] here and restores batch size 1 itself.
+            return out.reshape(out.shape[0], -1)
+        # Restore the padded core-attention output layout [S, B, Hq * D].
+        return out.view(batch, seqlen, -1).transpose(0, 1)
 
 
 class EagleModel(MegatronModule):
@@ -490,50 +814,49 @@ class EagleModel(MegatronModule):
             rope_scaling=getattr(config, "rope_scaling", False),
             rope_scaling_factor=getattr(config, "rope_scaling_factor", 8.0),
             use_cpu_initialization=getattr(
-                config,
-                "use_cpu_initialization",
-                not torch.cuda.is_available(),
+                config, "use_cpu_initialization", not torch.cuda.is_available()
             ),
         )
-        # Prevent modelopt import from breaking unrelated functionality.
-        # TODO: Investigate the circular import chain inside `modelopt.torch.quantization`:
-        # backends/__init__.py -> from .nvfp4_gemm import * -> nvfp4_gemm.py ->
-        # from ...quant_linear import RealQuantLinear -> quant_linear.py -> from ... import backends
+        # Import here to avoid a circular dependency inside ModelOpt's
+        # quantization backends.
         from modelopt.torch.speculative.plugins.megatron_eagle import EagleModule
 
-        # Many specdec libraries use LlamaForCausalLMEagle3 class by default so rope is hardcoded
+        # Supply RoPE explicitly instead of relying on the Llama-style defaults
+        # used by many speculative-decoding wrappers.
         self.eagle_module = EagleModule(
             config=config, rotary_pos_emb=rotary_pos_emb, bias=False
         )
 
-        # ModelOpt builds the Eagle decoder with the `arbitrary` attention-mask
-        # type, needed only for its multi-step-TTT staircase masks. NeMo-RL
-        # trains the draft with a single TTT step whose mask is plain causal,
-        # and `arbitrary` routes TE to the unfused backend that materializes
-        # the full O(seq^2) fp32 attention-probs tensor (OOM at long sequence
-        # lengths). Force the fused/flash causal path; the forward must then
-        # pass attention_mask=None.
+        # ModelOpt defaults to an arbitrary mask, which selects TE's unfused
+        # quadratic fp32 path. This file builds the mask itself, so the decoder
+        # can use the fused causal path and receive ``attention_mask=None``.
         for layer in self.eagle_module.decoder.layers:
             layer.self_attention.attn_mask_type = AttnMaskType.causal
 
+        # Multi-pass TTT needs the branch mask. CP also needs this implementation
+        # because TE's CP path does not expose the LSE required for merging.
+        cp_group = _global_cp_group()
+        cp_size = 1 if cp_group is None else cp_group.size()
+        self._needs_ttt_attention = self.ttt_steps > 1 or cp_size > 1
+
         self._ttt_attn_modules: list[TTTDraftCoreAttention] = []
         self._ttt_prenorm_hidden: Optional[Tensor] = None
-        if self.ttt_steps > 1:
+        if self._needs_ttt_attention:
             if getattr(config, "recompute_granularity", None) is not None:
-                # The checkpointed core-attention path re-enters forward during
-                # backward, which would corrupt the stateful per-pass KV stash.
+                # Activation recomputation would call this stateful attention
+                # again during backward and corrupt its per-pass K/V list.
                 raise ValueError(
-                    "TTT draft training (ttt_steps > 1) is incompatible with "
-                    "activation recomputation on the draft config."
+                    "TTT draft training (ttt_steps > 1 or CP > 1) is "
+                    "incompatible with activation recomputation on the draft "
+                    "config."
                 )
             for layer in self.eagle_module.decoder.layers:
                 ttt_attention = TTTDraftCoreAttention(config)
                 layer.self_attention.core_attention = ttt_attention
                 self._ttt_attn_modules.append(ttt_attention)
-            # modelopt's own last-layer hook detaches its capture (built for
-            # its recursion-free single-step use); TTT needs the pre-final-norm
-            # hidden state WITH gradients as the next pass's input, so register
-            # a separate non-detaching hook.
+        if self.ttt_steps > 1:
+            # ModelOpt's hook saves a detached value. TTT instead needs the
+            # pre-final-norm hidden state with gradients for the next pass.
             self.eagle_module.decoder.layers[-1].register_forward_hook(
                 self._capture_prenorm_hidden_hook
             )
@@ -550,15 +873,24 @@ class EagleModel(MegatronModule):
         sharded_offsets: Tuple[Tuple[int, int, int], ...] = (),
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
-        """Override to fix a bug in modelopt < 0.42.0.
+        """Build a sharded state dict with correct TP metadata.
 
-        In modelopt < 0.42.0, EagleTransformerBlock.sharded_state_dict omits
-        tp_group when calling sharded_state_dict_default for non-layer children
-        (e.g. final_layernorm). This causes make_sharded_tensors_for_checkpoint
-        to receive tp_group=None while dp_cp_group is set, so the
-        ``tp_group is None and dp_cp_group is None`` guard never fires, and
-        get_pg_rank(None)=0 is used for all TP ranks. With TP>1 and DP>1, two
-        ranks end up with replica_id=(0,0,0), triggering CheckpointingException.
+        ModelOpt versions before 0.42.0 omit ``tp_group`` for decoder children
+        outside the layer list, such as the final layer norm. With both TP and
+        DP enabled, this can assign the same checkpoint replica ID to multiple
+        ranks and raise ``CheckpointingException``.
+
+        This method first builds the normal state dict, then rebuilds only the
+        affected child entries with the decoder's TP group.
+
+        Args:
+            prefix: Prefix added to every state-dict key.
+            sharded_offsets: Parent-provided sharding offsets.
+            metadata: Distributed checkpoint metadata.
+
+        Returns:
+            Sharded state dict with corrected entries for non-layer decoder
+            children.
         """
         sd = super().sharded_state_dict(
             prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata
@@ -570,9 +902,8 @@ class EagleModel(MegatronModule):
 
         metadata = ensure_metadata_has_dp_cp_group(metadata)
 
-        # Regenerate all non-layer children of the decoder with the correct
-        # tp_group. EagleTransformerBlock asserts sharded_offsets=() so we
-        # always use () here too.
+        # Rebuild non-layer children with the correct TP group. ModelOpt's
+        # EagleTransformerBlock requires empty offsets for these entries.
         for name, module in decoder.named_children():
             if module is decoder.layers:
                 continue
@@ -582,11 +913,7 @@ class EagleModel(MegatronModule):
                     del sd[k]
             sd.update(
                 sharded_state_dict_default(
-                    module,
-                    child_prefix,
-                    (),
-                    metadata,
-                    tp_group=decoder.tp_group,
+                    module, child_prefix, (), metadata, tp_group=decoder.tp_group
                 )
             )
 
@@ -598,6 +925,7 @@ class EagleModel(MegatronModule):
         input_embeds: Tensor,
         attention_mask: Optional[Tensor] = None,
         bootstrap_hidden_states: bool = True,
+        packed_seq_params: Optional[Any] = None,
     ) -> Tensor:
         if bootstrap_hidden_states:
             hidden_states = self.eagle_module.fc(hidden_states)[0]
@@ -607,61 +935,138 @@ class EagleModel(MegatronModule):
                 f"`bootstrap_hidden_states=False`, got {hidden_states.shape[-1]}."
             )
 
-        hidden_states, _ = self.eagle_module(
-            embeddings=input_embeds,
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-        )
+        # Packed THD input needs explicit RoPE. EagleModule's fallback sizes the
+        # table from total packed tokens and slices it for CP too early.
+        rotary_pos_emb = None
+        if packed_seq_params is not None:
+            rotary_pos_emb = self._rotary_for_pass(
+                1, packed_seq_params, input_embeds.shape[0]
+            )
+
+        for ttt_attention in self._ttt_attn_modules:
+            ttt_attention.begin_pass(1)
+        try:
+            hidden_states, _ = self.eagle_module(
+                embeddings=input_embeds,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
+            )
+        finally:
+            for ttt_attention in self._ttt_attn_modules:
+                ttt_attention.reset()
         logits, _ = self.eagle_module.eagle_output_layer(hidden_states)
         logits = logits.transpose(0, 1).contiguous()
         return logits
 
-    def _ttt_rotary_pos_emb(self, ttt_pass: int, seq_len: int) -> Optional[Tensor]:
-        """Per-pass RoPE positions ``[d-1, S+d-2]``.
+    def _rotary_for_pass(
+        self,
+        ttt_pass: int,
+        packed_seq_params: Optional[Any],
+        local_seq_len: int,
+    ) -> Optional[Tensor]:
+        """Build RoPE frequencies for one TTT pass.
 
-        Pass-d anchor ``i`` sits at absolute position ``i + d - 1`` — both at
-        inference (the draft's KV cache advances one slot per speculated
-        token) and in modelopt's reference TTT (its repeated rotary plus the
-        one-row-per-pass stream shift produce exactly this offset). Pass 1 is
-        positions ``[0, S-1]``, which the eagle module computes itself from a
-        ``None`` rotary input.
+        Pass ``d`` shifts every position by ``d - 1``. A query at anchor ``i``
+        therefore uses position ``i + d - 1``, matching the extra cache entry
+        created at each speculation depth during serving.
+
+        For packed THD input, the table is based on the maximum subsequence
+        length rather than the total number of packed tokens. Positions restart
+        in every subsequence, and MCore performs the rank-local zigzag slice.
+        Using ``packed_seq=True`` prevents this method from slicing the table
+        before MCore receives it.
+
+        For padded input, pass 1 returns ``None`` because EagleModule's default
+        table is already correct. Later passes build a shifted global table;
+        when CP is active, this method then selects the current rank's zigzag
+        rows because the padded path applies the returned frequencies directly.
+
+        Args:
+            ttt_pass: One-indexed TTT pass ``d``.
+            packed_seq_params: THD packing metadata, or ``None`` for padded
+                input.
+            local_seq_len: Number of local rows in the padded input.
+
+        Returns:
+            Shifted RoPE frequencies for this pass, or ``None`` when the
+            single-pass padded default can be used.
         """
+        if packed_seq_params is not None:
+            max_seqlen = int(packed_seq_params.max_seqlen_q)
+            rotary = self.eagle_module.rotary_pos_emb(
+                max_seqlen + ttt_pass - 1, packed_seq=True
+            )
+            return rotary[ttt_pass - 1 :]
+
         if ttt_pass == 1:
             return None
-        rotary = self.eagle_module.rotary_pos_emb(seq_len + ttt_pass - 1)
-        return rotary[ttt_pass - 1 :]
+        cp_group = _global_cp_group()
+        cp_size = 1 if cp_group is None else cp_group.size()
+        global_seq_len = local_seq_len * cp_size
+        rotary = self.eagle_module.rotary_pos_emb(
+            global_seq_len + ttt_pass - 1, packed_seq=True
+        )
+        rotary = rotary[ttt_pass - 1 :]
+        if cp_size > 1:
+            from megatron.core.models.common.embeddings.rope_utils import (
+                get_pos_emb_on_this_cp_rank,
+            )
+
+            rotary = get_pos_emb_on_this_cp_rank(rotary, 0, cp_group)
+        return rotary
 
     def forward_ttt(
         self,
         hidden_states: Tensor,
         input_embeds: Tensor,
+        packed_seq_params: Optional[Any] = None,
     ) -> list[Tensor]:
-        """Run ``ttt_steps`` sequential draft passes and return per-pass logits.
+        """Run the configured TTT passes in sequence.
+
+        Pass 1 projects the target auxiliary hidden states. Every later pass
+        receives the previous pass's pre-final-norm hidden state without
+        detaching it, so gradients flow through the entire pass chain. Token
+        embeddings shift left by one position before each new pass. Packed
+        shifts stop at subsequence boundaries and exchange boundary values
+        between CP chunks when needed.
 
         Args:
-            hidden_states: Captured policy aux hidden states ``[S, B, 3h]``
-                (bootstrapped through ``fc`` for pass 1 only).
-            input_embeds: Pass-1 input embeddings ``e(x_{i+1})`` ``[S, B, h]``
-                (the caller has already rolled the captured embeddings by -1).
+            hidden_states: Target auxiliary hidden states with padded shape
+                ``[S, B, 3h]`` or packed local shape ``[T, 1, 3h]``.
+            input_embeds: Pass-1 token embeddings ``e(x_{i+1})`` with padded
+                shape ``[S, B, h]`` or packed shape ``[T, 1, h]``. They have
+                already been shifted left once within each subsequence.
+            packed_seq_params: Global THD packing metadata, or ``None`` for
+                padded input.
 
         Returns:
-            One ``[B, S, draft_vocab]`` logits tensor per pass; pass ``d``
-            position ``i`` predicts token ``x_{i+d+1}``.
-
-        Pass ``d >= 2`` feeds the previous pass's pre-final-norm hidden state
-        (non-detached: the h-chain must carry gradients) and the embeddings
-        rolled one more step. The per-layer attention modules stash pass-1 KV
-        as the trunk and later passes' KV as branch diagonals (see
-        ``TTTDraftCoreAttention``).
+            One logits tensor per pass. Padded tensors have shape
+            ``[B, S, draft_vocab]`` and packed tensors have shape
+            ``[1, T, draft_vocab]``. At pass ``d``, position ``i`` predicts
+            token ``x_{i+d+1}`` in its subsequence.
         """
         if self.ttt_steps < 2:
             raise RuntimeError(
                 "forward_ttt requires ttt_steps >= 2; use forward() for the "
                 "single-pass draft."
             )
-        # Deferred import mirrors train.py: mcore's MTP module is heavy and
-        # only needed on the draft training path.
+        # These helpers are needed only by the multi-pass training path.
         from megatron.core.transformer.multi_token_prediction import roll_tensor
+
+        from nemo_rl.algorithms.loss.utils import roll_packed_left_cp
+
+        cp_group = _global_cp_group()
+        cu_local = None
+        if packed_seq_params is not None:
+            cu_global = packed_seq_params.cu_seqlens_q_padded
+            if cu_global is None:
+                cu_global = packed_seq_params.cu_seqlens_q
+            cp_size = 1 if cp_group is None else cp_group.size()
+            cu_local = torch.div(cu_global, cp_size, rounding_mode="floor").to(
+                torch.int32
+            )
 
         hidden = self.eagle_module.fc(hidden_states)[0]
         embeds = input_embeds
@@ -674,10 +1079,12 @@ class EagleModel(MegatronModule):
                 decoder_hidden, _ = self.eagle_module(
                     embeddings=embeds,
                     hidden_states=hidden,
-                    # The TTT attention modules build their own trunk/branch
-                    # masking; an explicit mask tensor is rejected there.
+                    # The custom attention modules create the trunk/branch mask.
                     attention_mask=None,
-                    rotary_pos_emb=self._ttt_rotary_pos_emb(ttt_pass, embeds.shape[0]),
+                    rotary_pos_emb=self._rotary_for_pass(
+                        ttt_pass, packed_seq_params, embeds.shape[0]
+                    ),
+                    packed_seq_params=packed_seq_params,
                 )
                 logits, _ = self.eagle_module.eagle_output_layer(decoder_hidden)
                 logits_by_pass.append(logits.transpose(0, 1).contiguous())
@@ -689,15 +1096,14 @@ class EagleModel(MegatronModule):
                             "fire; cannot feed the next draft pass."
                         )
                     hidden = self._ttt_prenorm_hidden
-                    embeds = roll_tensor(
-                        embeds,
-                        shifts=-1,
-                        dims=0,
-                        cp_group=parallel_state.get_context_parallel_group(),
-                    )[0]
+                    if packed_seq_params is not None:
+                        embeds = roll_packed_left_cp(embeds, cu_local, cp_group)
+                    else:
+                        embeds = roll_tensor(
+                            embeds, shifts=-1, dims=0, cp_group=cp_group
+                        )[0]
         finally:
-            # Never leak stashed KV / captured hidden into the next microbatch,
-            # even if a pass raises mid-loop.
+            # Clear saved K/V and hidden states even if a pass raises an error.
             for ttt_attention in self._ttt_attn_modules:
                 ttt_attention.reset()
             self._ttt_prenorm_hidden = None

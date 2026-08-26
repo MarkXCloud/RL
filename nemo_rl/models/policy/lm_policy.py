@@ -122,13 +122,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "policy.draft.enabled=true is only supported with the Megatron backend. "
                 "Set policy.megatron_cfg.enabled=true or disable policy.draft."
             )
-        if draft_enabled and bool(
-            config.get("sequence_packing", {}).get("enabled", False)
-        ):
-            raise ValueError(
-                "policy.draft.enabled=true does not support sequence packing yet. "
-                "Disable policy.sequence_packing.enabled or policy.draft."
+        if draft_enabled:
+            packing_enabled = bool(
+                config.get("sequence_packing", {}).get("enabled", False)
             )
+            draft_cp_size = int(
+                config.get("megatron_cfg", {}).get("context_parallel_size", 1) or 1
+            )
+            if draft_cp_size > 1 and not packing_enabled:
+                raise ValueError(
+                    "policy.draft with context_parallel_size > 1 requires "
+                    "sequence packing (the trunk ring needs the THD zigzag "
+                    "layout). Enable policy.sequence_packing.enabled."
+                )
         if megatron_enable:
             worker_builder_cls_fqn = resolve_policy_worker_cls(
                 "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",

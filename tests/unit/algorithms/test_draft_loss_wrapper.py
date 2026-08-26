@@ -124,6 +124,7 @@ def test_draft_loss_wrapper_threads_draft_pass_counts(mock_draft_loss_cls):
 
     mock_draft_loss_cls.assert_called_once_with(
         vocab_parallel_group=None,
+        context_parallel_group=None,
         pass_weights=[1.0, 0.5],
     )
     call_kwargs = draft_loss_fn.call_args[1]

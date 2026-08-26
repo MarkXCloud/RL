@@ -270,6 +270,7 @@ class DraftLossWrapper:
             self.draft_loss_fn: Any = DSparkBlockLossFn(
                 vocab_parallel_group=vocab_parallel_group,
                 vocab_parallel_rank=vocab_parallel_rank,
+                context_parallel_group=context_parallel_group,
                 **draft_loss_kwargs,
             )
         elif draft_method == "dflash":
@@ -277,6 +278,7 @@ class DraftLossWrapper:
 
             self.draft_loss_fn = BlockDraftLossFn(
                 vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
                 **draft_loss_kwargs,
             )
         elif draft_method == "eagle3":
@@ -286,6 +288,7 @@ class DraftLossWrapper:
 
             self.draft_loss_fn = DraftCrossEntropyLossFn(
                 vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
                 **draft_loss_kwargs,
             )
         else:
@@ -334,7 +337,20 @@ class DraftLossWrapper:
             **loss_input,
         )
         combined_loss = policy_loss + self.loss_weight * draft_loss
-        metrics["draft_loss"] = float(draft_loss.detach().item())
+        # Under CP each rank's draft_loss covers only its sequence shard over
+        # a global denominator; the metric must sum across CP explicitly (the
+        # gradient path does so implicitly via the grad all-reduce).
+        draft_loss_metric = draft_loss.detach()
+        if (
+            self.context_parallel_group is not None
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(self.context_parallel_group) > 1
+        ):
+            draft_loss_metric = draft_loss_metric.clone()
+            torch.distributed.all_reduce(
+                draft_loss_metric, group=self.context_parallel_group
+            )
+        metrics["draft_loss"] = float(draft_loss_metric.item())
         metrics.update(draft_metrics)
         return combined_loss, metrics
 

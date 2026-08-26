@@ -159,12 +159,17 @@ def _run_block_draft_forward(
     draft_model: MegatronModule,
     captured_states: Any,
     data_dict: BatchedDataDict[Any],
+    packed_seq_params: Optional[PackedSeqParams] = None,
 ) -> torch.Tensor:
     """Run the DFlash/DSpark block-draft forward for one microbatch.
 
-    Returns prediction-slot logits ``[B, N, gamma, V_local]`` aligned with
-    labels ``x_{p+1} .. x_{p+gamma}`` per anchor ``p`` (DFlash's bonus anchor
-    slot is dropped; DSpark's teacher-forced Markov bias is added).
+    Returns prediction-slot logits aligned with labels ``x_{p+1} ..
+    x_{p+gamma}`` per anchor ``p`` (DFlash's bonus anchor slot is dropped;
+    DSpark's teacher-forced Markov bias is added): ``[B, N, gamma, V_local]``
+    unpacked, ``[NB, gamma, V_local]`` packed — under packing each block is
+    owned by the CP rank holding its anchor's zigzag chunk (which balances
+    the staircase load the way zigzag balances causal, and keeps the anchor
+    embedding local); the flat owned coords are stashed for the loss.
 
     Following the official DFlash contract the draft owns neither an LM head
     nor a mask embedding: logits are projected through the policy's LIVE head
@@ -185,10 +190,52 @@ def _run_block_draft_forward(
     # length-bucket reorder); rebuild this microbatch's block list and stash
     # it for the loss (slot mask + teacher gather read these keys).
     anchors, anchor_valid = count_map_to_anchors(data_dict["draft_anchor_count_map"])
-    data_dict["draft_anchor_positions"] = anchors
-    data_dict["draft_anchor_valid"] = anchor_valid
 
-    method_kwargs = {}
+    method_kwargs: dict[str, Any] = {}
+    if packed_seq_params is not None:
+        cp_group = get_context_parallel_group()
+        cp_size = torch.distributed.get_world_size(cp_group)
+        cp_rank = torch.distributed.get_rank(cp_group)
+        cu_global = packed_seq_params.cu_seqlens_q_padded
+        if cu_global is None:
+            cu_global = packed_seq_params.cu_seqlens_q
+        cu_local = torch.div(cu_global, cp_size, rounding_mode="floor").to(torch.long)
+        half = ((cu_local[1:] - cu_local[:-1]) // 2).clamp(min=1)
+
+        batch_size, num_anchors = anchors.shape
+        seq_flat = (
+            torch.arange(batch_size, device=anchors.device)
+            .unsqueeze(1)
+            .expand(-1, num_anchors)
+            .reshape(-1)
+        )
+        anchors_flat = anchors.reshape(-1)
+        valid_flat = anchor_valid.reshape(-1)
+        chunk_idx = anchors_flat // half[seq_flat]
+        owner = torch.minimum(chunk_idx, 2 * cp_size - 1 - chunk_idx)
+        mine = owner == cp_rank
+        seq_flat = seq_flat[mine]
+        anchors_flat = anchors_flat[mine]
+        valid_flat = valid_flat[mine]
+        if seq_flat.numel() == 0:
+            # Every rank must field >= 1 block: the trunk ring is a CP
+            # collective and the decoder cannot run an empty stream. A dummy
+            # invalid block at this rank's front-chunk start is loss-masked.
+            seq_flat = torch.zeros(1, dtype=torch.long, device=anchors.device)
+            anchors_flat = (cp_rank * half[0]).reshape(1)
+            valid_flat = torch.zeros(1, dtype=torch.bool, device=anchors.device)
+
+        data_dict["draft_anchor_positions"] = anchors_flat
+        data_dict["draft_anchor_valid"] = valid_flat
+        data_dict["draft_block_seq_idx"] = seq_flat
+        data_dict["draft_packed_local_cu_seqlens"] = cu_local
+        method_kwargs["packed_seq_params"] = packed_seq_params
+        method_kwargs["block_seq_idx"] = seq_flat
+        anchors, anchor_valid = anchors_flat, valid_flat
+    else:
+        data_dict["draft_anchor_positions"] = anchors
+        data_dict["draft_anchor_valid"] = anchor_valid
+
     if draft_model.method == "dspark":
         # Teacher-forces the Markov/confidence heads inside the forward.
         method_kwargs["input_ids"] = data_dict["input_ids"]
@@ -206,6 +253,8 @@ def _run_block_draft_forward(
     if draft_model.method == "dflash":
         # Slot 0 is the anchor bonus slot (condition only); the gamma mask
         # slots align with labels x_{p+1} .. x_{p+gamma}.
+        if packed_seq_params is not None:
+            return draft_out[:, 1:, :]
         return draft_out[:, :, 1:, :]
     elif draft_model.method == "dspark":
         block_logits, confidence_pred = draft_out
@@ -340,20 +389,54 @@ def forward_with_post_processing_fn(
                 draft_model=draft_model,
                 captured_states=captured_states,
                 data_dict=data_dict,
+                packed_seq_params=packed_seq_params,
             )
         else:
             from megatron.core.transformer.multi_token_prediction import roll_tensor
 
-            shifted_input_embeds = roll_tensor(
-                captured_states.inputs_embeds,
-                shifts=-1,
-                dims=0,
-                cp_group=get_context_parallel_group(),
-            )[0]
+            from nemo_rl.algorithms.loss.utils import (
+                packed_zigzag_token_coords,
+                roll_packed_left_cp,
+            )
+
+            cp_group = get_context_parallel_group()
+            if packed_seq_params is not None:
+                # Packed (THD) input: the pass-1 shift must stop at
+                # subsequence boundaries and, under CP, exchange the zigzag
+                # chunk-boundary elements. Also stash the local->(subseq,
+                # position) coords the packed draft loss uses to gather its
+                # per-pass masks from the unpacked [B, S] token_mask.
+                cp_size = torch.distributed.get_world_size(cp_group)
+                cp_rank = torch.distributed.get_rank(cp_group)
+                cu_global = packed_seq_params.cu_seqlens_q_padded
+                if cu_global is None:
+                    cu_global = packed_seq_params.cu_seqlens_q
+                cu_local = torch.div(cu_global, cp_size, rounding_mode="floor").to(
+                    torch.int32
+                )
+                seq_index, pos_in_seq = packed_zigzag_token_coords(
+                    cu_global, cp_rank, cp_size
+                )
+                data_dict["draft_packed_seq_index"] = seq_index
+                data_dict["draft_packed_pos_in_seq"] = pos_in_seq
+                data_dict["draft_packed_local_cu_seqlens"] = cu_local
+                shifted_input_embeds = roll_packed_left_cp(
+                    captured_states.inputs_embeds,
+                    cu_local,
+                    cp_group if cp_size > 1 else None,
+                )
+            else:
+                shifted_input_embeds = roll_tensor(
+                    captured_states.inputs_embeds,
+                    shifts=-1,
+                    dims=0,
+                    cp_group=cp_group,
+                )[0]
             if draft_ttt_steps > 1:
                 data_dict["student_logits_by_pass"] = draft_model.forward_ttt(
                     hidden_states=captured_states.hidden_states,
                     input_embeds=shifted_input_embeds,
+                    packed_seq_params=packed_seq_params,
                 )
             else:
                 data_dict["student_logits"] = draft_model(
@@ -363,6 +446,7 @@ def forward_with_post_processing_fn(
                     # (see EagleModel); an explicit mask tensor would route TE
                     # back to the unfused O(seq^2) backend.
                     attention_mask=None,
+                    packed_seq_params=packed_seq_params,
                 )
 
     # Apply temperature scaling only for sampling-oriented post-processors.
@@ -525,6 +609,47 @@ class LossPostProcessor:
             # Block drafts (DFlash/DSpark) train full-vocab in v1 (no d2t).
             self.d2t = None
 
+    def _wrap_with_draft_loss(
+        self,
+        loss_fn_wrapped: Any,
+        prepare_fn: Callable[..., Any],
+        data_dict: BatchedDataDict[Any],
+        global_draft_pass_counts: Optional[torch.Tensor],
+    ) -> "DraftLossWrapper":
+        """Wrap the (possibly packing-wrapped) policy loss with the draft loss."""
+        draft_cfg = self.cfg["draft"]
+        draft_method = draft_cfg.get("method", "eagle3")
+        # Ctor kwargs for the method's draft LossFn (uniform shape;
+        # DraftLossWrapper splats them into the selected class).
+        if draft_method in ("dflash", "dspark"):
+            draft_loss_kwargs: dict[str, Any] = {
+                "slot_weights": resolve_block_draft_slot_weights(
+                    draft_cfg.get("loss_weighting"), int(draft_cfg["gamma"])
+                )
+            }
+            if draft_method == "dspark":
+                for key in (
+                    "ce_loss_alpha",
+                    "tv_loss_alpha",
+                    "confidence_head_alpha",
+                ):
+                    if draft_cfg.get(key) is not None:
+                        draft_loss_kwargs[key] = float(draft_cfg[key])
+        else:
+            draft_loss_kwargs = {"pass_weights": draft_cfg.get("ttt_pass_weights")}
+        return DraftLossWrapper(
+            loss_fn=loss_fn_wrapped,
+            prepare_fn=prepare_fn,
+            data_dict=data_dict,
+            loss_weight=float(draft_cfg["loss_weight"]),
+            draft_loss_kwargs=draft_loss_kwargs,
+            global_draft_pass_counts=global_draft_pass_counts,
+            vocab_parallel_rank=get_tensor_model_parallel_rank(),
+            vocab_parallel_group=get_tensor_model_parallel_group(),
+            context_parallel_group=get_context_parallel_group(),
+            draft_method=draft_method,
+        )
+
     def __call__(
         self,
         data_dict: BatchedDataDict[Any],
@@ -568,14 +693,14 @@ class LossPostProcessor:
             or "draft_block_logits" in data_dict
         )
         if pack_sequences and packed_seq_params is not None:
-            if has_draft_logits:
-                # Neither packing wrapper threads the draft hook, so the draft
-                # loss would silently never train; fail loudly instead.
-                raise NotImplementedError(
-                    "Draft-model training is not supported with sequence "
-                    "packing; disable policy.sequence_packing."
-                )
             fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
+            if has_draft_logits and fuse_loss:
+                # The fused policy-loss prep never materializes full logits in
+                # a form the draft's soft-CE teacher prep was validated with.
+                raise NotImplementedError(
+                    "Draft-model training with sequence packing requires "
+                    "sequence_packing.fuse_loss=false."
+                )
             if fuse_loss:
                 # The fused path prepares loss via prepare_packed_loss_input and
                 # cannot honor a custom prepare_fn (e.g. the value model's); guard
@@ -604,6 +729,17 @@ class LossPostProcessor:
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
             )
+            if has_draft_logits:
+                # The draft loss wraps AROUND the packing wrapper: the policy
+                # part iterates subsequences, the draft part runs once over
+                # the whole packed row (per-pass teacher roll + coord-gathered
+                # masks; see DraftCrossEntropyLossFn's packed mode).
+                loss_fn_wrapped = self._wrap_with_draft_loss(
+                    loss_fn_wrapped,
+                    prepare_loss_input_wrapped,
+                    data_dict,
+                    global_draft_pass_counts,
+                )
         else:
             loss_fn_wrapped = partial(
                 wrap_loss_fn_with_input_preparation,
@@ -614,39 +750,11 @@ class LossPostProcessor:
                 context_parallel_group=get_context_parallel_group(),
             )
             if has_draft_logits:
-                draft_cfg = self.cfg["draft"]
-                draft_method = draft_cfg.get("method", "eagle3")
-                # Ctor kwargs for the method's draft LossFn (uniform shape;
-                # DraftLossWrapper splats them into the selected class).
-                if draft_method in ("dflash", "dspark"):
-                    draft_loss_kwargs: dict[str, Any] = {
-                        "slot_weights": resolve_block_draft_slot_weights(
-                            draft_cfg.get("loss_weighting"), int(draft_cfg["gamma"])
-                        )
-                    }
-                    if draft_method == "dspark":
-                        for key in (
-                            "ce_loss_alpha",
-                            "tv_loss_alpha",
-                            "confidence_head_alpha",
-                        ):
-                            if draft_cfg.get(key) is not None:
-                                draft_loss_kwargs[key] = float(draft_cfg[key])
-                else:
-                    draft_loss_kwargs = {
-                        "pass_weights": draft_cfg.get("ttt_pass_weights")
-                    }
-                loss_fn_wrapped = DraftLossWrapper(
-                    loss_fn=loss_fn_wrapped,
-                    prepare_fn=prepare_loss_input_wrapped,
-                    data_dict=data_dict,
-                    loss_weight=float(draft_cfg["loss_weight"]),
-                    draft_loss_kwargs=draft_loss_kwargs,
-                    global_draft_pass_counts=global_draft_pass_counts,
-                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
-                    vocab_parallel_group=get_tensor_model_parallel_group(),
-                    context_parallel_group=get_context_parallel_group(),
-                    draft_method=draft_method,
+                loss_fn_wrapped = self._wrap_with_draft_loss(
+                    loss_fn_wrapped,
+                    prepare_loss_input_wrapped,
+                    data_dict,
+                    global_draft_pass_counts,
                 )
 
         loss_fn_wrapped = partial(
